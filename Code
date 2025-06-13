@@ -1,0 +1,4259 @@
+# ——— Standard Library —————————————————————————————————————————————
+import warnings
+import gc
+warnings.filterwarnings('ignore')
+import sys
+!{sys.executable} -m pip install seaborn --quiet
+
+# ——— Data & Math Libraries ————————————————————————————————————————
+import pandas as pd
+import numpy as np
+from scipy import stats
+import statsmodels.api as sm
+
+# ——— Plotting Libraries ——————————————————————————————————————————
+import matplotlib.pyplot as plt
+import matplotlib.style as style
+import matplotlib.patches as mpatches
+import matplotlib.ticker as mtick
+from matplotlib.colors import LinearSegmentedColormap
+import seaborn as sns
+
+# ——— Display & Style ———————————————————————————————————————————
+from IPython.display import display
+style.use('seaborn-v0_8-whitegrid')
+
+#####################################
+# PART 1: MERGING CRSP AND COMPUSTAT
+####################################
+
+# Load and preprocess data
+crsp = pd.read_csv("/Users/  XXX  /CRSP 4.csv", parse_dates=["datadate"])
+comp = pd.read_csv("/Users/  XXX  /Compustat 2.csv", parse_dates=["datadate"])
+
+# Standardize column names and rename date columns
+crsp.columns = crsp.columns.str.lower()
+comp.columns = comp.columns.str.lower()
+crsp = crsp.rename(columns={"datadate": "crsp_date"})
+comp = comp.rename(columns={"datadate": "fund_date"})
+
+# Apply 6-month lag to CRSP dates for lagged book values
+crsp["lag_date"] = crsp["crsp_date"] - pd.DateOffset(months=6)
+
+# Apply data quality filters
+crsp = crsp[crsp["prccm"] >= 1]  # Exclude penny stocks
+# Filter for specific exchange codes (e.g., NYSE=11, AMEX=12, NASDAQ (Small Cap)=13, NASDAQ (NMS)=14)
+crsp = crsp[crsp['exchg'].isin([11, 12, 13, 14])] 
+crsp = crsp[crsp['fic'] == 'USA']  # US stocks only
+
+# Remove missing data and sort for merging
+crsp = crsp.dropna(subset=["gvkey", "lag_date"])
+comp = comp.dropna(subset=["gvkey", "fund_date"])
+crsp = crsp.sort_values(by="lag_date").reset_index(drop=True)
+comp = comp.sort_values(by="fund_date").reset_index(drop=True)
+
+# Merge CRSP and Compustat using 6-month lag
+merged = pd.merge_asof(
+    crsp,
+    comp,
+    by="gvkey",
+    left_on="lag_date",
+    right_on="fund_date",
+    direction="backward",
+    tolerance=pd.Timedelta(days=186)
+)
+
+# Clean up merged dataset
+merged = merged.drop(columns=["lag_date", "fund_date"])
+merged = merged.drop(columns=[col for col in merged.columns if col.endswith('_y')])
+merged = merged.rename(columns={col: col.replace('_x', '') for col in merged.columns if col.endswith('_x')})
+
+############################################################################################
+# PART 1.5: ENSURING 12 MONTHS OF RETURN HISTORY
+############################################################################################
+
+print("Before return history filter:", len(merged))
+
+# Filter for stocks with 12 months of consecutive return history
+returns_data = merged[['gvkey', 'crsp_date', 'trt1m']].copy()
+returns_data['trt1m_available'] = returns_data['trt1m'].notna()
+
+grouped = returns_data.sort_values(['gvkey', 'crsp_date'])
+grouped['prev_returns_count'] = grouped.groupby('gvkey')['trt1m_available'].rolling(window=12, min_periods=12).sum().reset_index(0, drop=True)
+
+history_filter = grouped[grouped['prev_returns_count'] == 12][['gvkey', 'crsp_date']]
+history_filter['has_12_month_history'] = True
+
+merged = pd.merge(merged, history_filter, on=['gvkey', 'crsp_date'], how='left')
+merged = merged[merged['has_12_month_history'] == True]
+merged.drop('has_12_month_history', axis=1, inplace=True)
+
+print("After return history filter:", len(merged))
+
+############################################################################################
+# PART 2: COMPUTING BOOK-TO-MARKET RATIOS
+############################################################################################
+
+# Convert financial data to numeric and calculate book equity
+for col in ["seqq", "txditcq", "pstkq", "prccm", "cshoq"]:
+    merged[col] = pd.to_numeric(merged[col], errors="coerce")
+
+merged['txditcq'] = merged['txditcq'].fillna(0)
+merged['pstkq'] = merged['pstkq'].fillna(0)
+
+merged["book_equity"] = merged["seqq"] + merged["txditcq"] - merged["pstkq"]
+merged["market_cap"] = merged["prccm"] * merged["cshoq"]
+merged["bm"] = merged["book_equity"] / merged["market_cap"]
+
+# Dataset summary
+unique_stocks = len(merged['lpermno'].unique())
+total_observations = len(merged)
+print(f"Total unique stocks in dataset: {unique_stocks}")
+print(f"Total observations: {total_observations}")
+
+# Count unique stocks in the dataset
+unique_stocks = len(merged['lpermno'].unique())
+
+# Count total observations
+total_observations = len(merged)
+
+# Print results
+print(f"Total unique stocks in dataset: {unique_stocks}")
+print(f"Total observations: {total_observations}")
+pd.set_option('display.max_columns', None)
+
+merged.tail()
+
+############################################################################################
+# PART 3: GICS SECTOR CLASSIFICATION AND MARKET CAP CORRECTIONS
+############################################################################################
+
+# Assign GICS sector classifications
+gic_mapping = pd.read_csv("/Users/  XXX  /GIC Codes and Classifcation.csv")
+sector_map = dict(zip(gic_mapping['gic_code'], gic_mapping['gic_sector' ]))
+merged['gic_sector'] = merged['gsector'].map(sector_map)
+merged['gic_sector'] = merged['gic_sector'].fillna('Other')
+merged['gic_sector'] = merged['gic_sector'].astype('category')
+
+# Ensure numeric columns for market cap calculation
+for col in ["prccm", "cshoq"]:
+    merged[col] = pd.to_numeric(merged[col], errors="coerce")
+
+merged["market_cap"] = merged["prccm"] * merged["cshoq"]
+
+# --- Check row count before correction ---
+n_rows_before = merged.shape[0]
+
+# Remove duplicates first to avoid showing duplicates in the display
+merged = merged.drop_duplicates(subset=["gvkey", "crsp_date"], keep="first")
+
+# Debug: Check what BRK.A dates are available from August to December 2010
+print("DEBUG: Available BRK.A dates from August to December 2010:")
+brk_debug = merged[(merged['tic'] == 'BRK.A') & 
+                  (merged['crsp_date'] >= '2010-08-01') & 
+                  (merged['crsp_date'] <= '2010-12-31')]['crsp_date'].sort_values()
+print(brk_debug.tolist())
+print()
+
+# Fix BRK.A share count issue after October 2010
+print("BRK.A Data Around August to December 2010:")
+print("=" * 100)
+# Get all BRK.A rows from August to December 2010
+brk_mask_range = (
+    (merged['tic'] == 'BRK.A') &
+    (merged['crsp_date'] >= '2010-08-01') &
+    (merged['crsp_date'] <= '2010-12-31')
+)
+brk_around_2010 = merged.loc[brk_mask_range, ['crsp_date', 'prccm', 'cshoq', 'market_cap']].sort_values('crsp_date')
+print(brk_around_2010)
+print(f"\nDisplayed rows: {len(brk_around_2010)}")
+
+# Apply BRK.A correction
+brk_mask = (merged['tic'] == 'BRK.A') & (merged['crsp_date'] >= '2010-10-01')
+merged.loc[brk_mask, 'cshoq'] = merged.loc[brk_mask, 'cshoq'] / 1000
+merged["market_cap"] = merged["prccm"] * merged["cshoq"]
+
+# --- Display the same set of rows after correction (no duplicates) ---
+print("\nBRK.A Data Around August to December 2010 (After Correction):")
+print("=" * 100)
+brk_around_2010_after = merged.loc[brk_mask_range, ['crsp_date', 'prccm', 'cshoq', 'market_cap']].sort_values('crsp_date')
+print(brk_around_2010_after)
+print(f"\nDisplayed rows: {len(brk_around_2010_after)}")
+
+# Check if specific months are missing
+missing_months = []
+expected_months = ['2010-08-31', '2010-09-30', '2010-10-31', '2010-11-30', '2010-12-31']
+available_dates = brk_around_2010_after['crsp_date'].dt.strftime('%Y-%m-%d').tolist()
+
+for month in expected_months:
+    if month not in available_dates:
+        missing_months.append(month)
+
+if missing_months:
+    print(f"\nNOTE: Missing BRK.A data for months: {missing_months}")
+else:
+    print("\nAll expected months have BRK.A data available")
+
+# (Optional) Show summary after duplicate removal
+print(f"\nSummary: {len(brk_around_2010)} rows displayed before, {len(brk_around_2010_after)} rows displayed after correction, {len(merged)} rows in merged after duplicate removal")
+
+############################################################################################
+# PART 4: US STOCK MARKET UNIVERSE
+############################################################################################
+
+# Create US stock market universe from corrected merged dataset
+US_Stock_Market = merged.copy()
+
+# Filter for valid market capitalization
+US_Stock_Market = US_Stock_Market[
+    US_Stock_Market["market_cap"].notnull() & 
+    (US_Stock_Market["market_cap"] > 0)
+]
+
+############################################################################################
+# PERIOD OF ANALYSIS CONFIGURATION
+############################################################################################
+
+# Analysis Start Date is the date that captures the first month of the sample universe
+# But as the methodology ranks stocks based on the past 6 months, the returns of the analysis 
+# begin 6 months after; hence, 1981-01-01.
+
+# Define the period required for the analysis to be conducted at 1981-01-01 until Analysis End Date.
+ANALYSIS_START_DATE = pd.to_datetime('1980-06-01')
+ANALYSIS_END_DATE = pd.to_datetime('2022-05-31')
+
+print(f"Analysis Period Set: {ANALYSIS_START_DATE.strftime('%Y-%m-%d')} to {ANALYSIS_END_DATE.strftime('%Y-%m-%d')}")
+print("="*80)
+
+############################################################################################
+# PART 5: VISUALIZING MARKET CAP EVOLUTION BY GICS SECTOR
+############################################################################################
+
+# Set up visualization parameters
+plt.style.use('seaborn-v0_8-whitegrid')
+start_date_viz = ANALYSIS_START_DATE
+end_date_viz = ANALYSIS_END_DATE
+
+# Prepare data for visualization
+US_Stock_Market['crsp_date'] = pd.to_datetime(US_Stock_Market['crsp_date'])
+US_Stock_Market['year_month'] = US_Stock_Market['crsp_date'].dt.to_period('M')
+
+viz_data = US_Stock_Market[
+    (US_Stock_Market['crsp_date'] >= start_date_viz) &
+    (US_Stock_Market['crsp_date'] <= end_date_viz) &
+    (US_Stock_Market['gic_sector'] != 'Other') &
+    (US_Stock_Market['market_cap'].notna()) &
+    (US_Stock_Market['market_cap'] > 0)
+].copy()
+
+print("="*50)
+print("                US STOCK UNIVERSE")
+print("="*50)
+
+# Calculate monthly market cap metrics
+monthly_sector_market_cap = viz_data.groupby(['year_month', 'gic_sector'], observed=True)['market_cap'].sum().reset_index()
+monthly_total_market_cap = viz_data.groupby('year_month', observed=True)['market_cap'].sum().reset_index()
+monthly_total_market_cap.rename(columns={'market_cap': 'total_monthly_cap'}, inplace=True)
+
+monthly_sector_market_cap = pd.merge(monthly_sector_market_cap, monthly_total_market_cap, on='year_month')
+monthly_sector_market_cap['market_cap_percentage'] = (monthly_sector_market_cap['market_cap'] / monthly_sector_market_cap['total_monthly_cap']) * 100
+monthly_sector_market_cap['date_for_plot'] = monthly_sector_market_cap['year_month'].dt.to_timestamp()
+
+# Create pivot tables
+pivot_market_cap_abs = monthly_sector_market_cap.pivot(index='date_for_plot', columns='gic_sector', values='market_cap')
+pivot_market_cap_pct = monthly_sector_market_cap.pivot(index='date_for_plot', columns='gic_sector', values='market_cap_percentage')
+
+# Plot 1: Absolute Market Cap
+fig_abs, ax_abs = plt.subplots(1, 1, figsize=(16, 8))
+for sector in pivot_market_cap_abs.columns:
+    ax_abs.plot(pivot_market_cap_abs.index, pivot_market_cap_abs[sector] / 1000, label=sector)
+ax_abs.set_title(f'Absolute Market Cap by GICS Sector ({start_date_viz.year}-{end_date_viz.year}, $ Billions)', fontsize=15)
+ax_abs.set_ylabel('Market Cap ($ Billions)', fontsize=12)
+ax_abs.set_xlabel('Date', fontsize=12)
+ax_abs.legend(title='GICS Sector', loc='upper left', bbox_to_anchor=(1, 1.02))
+ax_abs.grid(True, alpha=0.4)
+plt.tight_layout(rect=[0, 0, 0.88, 1])
+plt.show()
+
+# Plot 2: Relative Market Cap
+plt.figure(figsize=(16, 8))
+for sector in pivot_market_cap_pct.columns:
+    plt.plot(pivot_market_cap_pct.index, pivot_market_cap_pct[sector], label=sector)
+plt.title(f'Relative Market Cap by GICS Sector (% of Total Market, {start_date_viz.year}-{end_date_viz.year})', fontsize=15)
+plt.ylabel('Market Cap Share (%)', fontsize=12)
+plt.xlabel('Date', fontsize=12)
+plt.ylim(0, max(40, (pivot_market_cap_pct.max().max() * 1.1)))
+plt.legend(title='GICS Sector', loc='upper left', bbox_to_anchor=(1, 1.02))
+plt.grid(True, alpha=0.4)
+plt.tight_layout(rect=[0, 0, 0.88, 1])
+plt.show()
+
+# Plot 3: Stacked Area Chart
+plt.figure(figsize=(16, 10))
+pivot_market_cap_pct_filled = pivot_market_cap_pct.fillna(0)
+plt.stackplot(pivot_market_cap_pct_filled.index,
+             [pivot_market_cap_pct_filled[col] for col in pivot_market_cap_pct_filled.columns],
+             labels=pivot_market_cap_pct_filled.columns, alpha=0.85)
+plt.title(f'Market Composition by Sector Over Time (% of Total, {start_date_viz.year}-{end_date_viz.year})', fontsize=16)
+plt.ylabel('Market Share (%)', fontsize=12)
+plt.xlabel('Date', fontsize=12)
+plt.ylim(0, 100)
+plt.legend(title='GICS Sector', loc='upper left', bbox_to_anchor=(1, 1.02))
+plt.grid(True, alpha=0.4)
+plt.tight_layout(rect=[0, 0, 0.88, 1])
+plt.show()
+
+# Summary Statistics
+print("\nMarket Cap Share by GICS Sector (%) for Selected Years:")
+print("=" * 110)
+
+start_year = start_date_viz.year
+end_year = end_date_viz.year
+summary_years = [start_year + 4, start_year + 14, start_year + 24, start_year + 34, end_year]
+summary_years = [year for year in summary_years if start_year <= year <= end_year]
+
+header_format_string = "{:<25}" + "".join(["{:>15}" for _ in summary_years])
+print(header_format_string.format("GICS Sector", *summary_years))
+print("-" * 110)
+
+for sector in sorted(pivot_market_cap_pct.columns):
+    values = []
+    for year in summary_years:
+        target_date = pd.Timestamp(f"{year}-06-30")
+        year_data = pivot_market_cap_pct[pivot_market_cap_pct.index.year == year]
+        if not year_data.empty:
+            closest_date = year_data.index[np.abs(year_data.index - target_date).argmin()]
+            value = year_data.loc[closest_date, sector] if sector in year_data.columns else np.nan
+        else:
+            value = np.nan
+        values.append("{:.2f}".format(value) if pd.notna(value) else "N/A")
+    
+    row_format_string = "{:<25}" + "".join(["{:>15}" for _ in summary_years])
+    print(row_format_string.format(sector, *values))
+print("=" * 110)
+
+############################################################################################
+# PART 6: TOTAL MARKET CAPITALIZATION OVER TIME (ALL STOCKS)
+############################################################################################
+
+print("="*50)
+print("                US STOCK UNIVERSE")
+print("="*50)
+
+# Filter data for analysis period and calculate total market cap by month
+start_date = ANALYSIS_START_DATE
+end_date = ANALYSIS_END_DATE
+
+US_Stock_Market['crsp_date'] = pd.to_datetime(US_Stock_Market['crsp_date'])
+
+filtered_data = US_Stock_Market[
+    (US_Stock_Market['crsp_date'] >= start_date) &
+    (US_Stock_Market['crsp_date'] <= end_date) &
+    (US_Stock_Market['market_cap'].notna()) &
+    (US_Stock_Market['market_cap'] > 0)
+].copy()
+
+total_market_cap = filtered_data.groupby('crsp_date')['market_cap'].sum().reset_index()
+
+# Create visualization
+plt.figure(figsize=(16, 8))
+plt.plot(total_market_cap['crsp_date'], total_market_cap['market_cap'] / 1000, color='navy', linewidth=2)
+plt.title(f'Total Market Capitalization Over Time ({start_date.year}-{end_date.year}, $ Billions)', fontsize=15)
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Total Market Cap ($ Billions)', fontsize=12)
+plt.grid(True, alpha=0.3)
+
+brk_correction_date = pd.Timestamp('2010-01-01')
+plt.axvline(x=brk_correction_date, color='red', linestyle='--', alpha=0.7)
+plt.text(brk_correction_date, plt.gca().get_ylim()[1], 'BRK Correction', rotation=90, verticalalignment='top', horizontalalignment='right')
+plt.tight_layout()
+plt.show()
+
+# Print summary statistics
+print("\nSummary Statistics for Total Market Capitalization:")
+print("=" * 80)
+
+start_year = start_date.year
+end_year = end_date.year
+summary_years = [start_year + 4, start_year + 14, start_year + 24, start_year + 34, end_year]
+summary_years = [year for year in summary_years if start_year <= year <= end_year]
+
+print("{:<20} {:>15}".format("Year", "Market Cap ($B)"))
+print("-" * 80)
+
+for year in summary_years:
+    target_date = pd.Timestamp(f"{year}-06-30")
+    closest_date = total_market_cap['crsp_date'][np.abs(total_market_cap['crsp_date'] - target_date).argmin()]
+    market_cap = total_market_cap[total_market_cap['crsp_date'] == closest_date]['market_cap'].values[0] / 1000
+    print("{:<20} {:>15,.2f}".format(str(year), market_cap))
+
+print("=" * 80)
+
+max_cap = total_market_cap['market_cap'].max() / 1000
+max_date = total_market_cap.loc[total_market_cap['market_cap'].idxmax(), 'crsp_date']
+print(f"\nPeak Market Cap: ${max_cap:,.2f} billion")
+print(f"Peak Date: {max_date.strftime('%Y-%m-%d')}")
+
+start_cap = total_market_cap.iloc[0]['market_cap']
+end_cap = total_market_cap.iloc[-1]['market_cap']
+years = (total_market_cap.iloc[-1]['crsp_date'] - total_market_cap.iloc[0]['crsp_date']).days / 365.25
+cagr = (((end_cap/start_cap) ** (1/years)) - 1) * 100
+print(f"\nCompound Annual Growth Rate (CAGR): {cagr:.2f}%")
+
+import matplotlib.pyplot as plt
+from matplotlib.font_manager import FontProperties
+
+# Try to use Palatino, fallback to DejaVu Serif, then Times New Roman
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Palatino', 'DejaVu Serif', 'Times New Roman']
+
+# Define bold font properties for titles and axis labels
+bold_font = FontProperties(family='serif', weight='bold', size=16)
+
+plt.figure(figsize=(16, 8))
+plt.plot(
+    total_market_cap['crsp_date'],
+    total_market_cap['market_cap'] / 1_000_000,  # Trillions
+    color='navy',
+    linewidth=2
+)
+
+plt.title('Market Capitalization of the US Stock Market Over Time ($ Trillions)', fontproperties=bold_font)
+plt.xlabel('Year', fontproperties=bold_font)
+plt.ylabel('Total Market Cap ($ Trillions)', fontproperties=bold_font)
+
+plt.grid(True, alpha=0.3)
+plt.xticks(fontsize=14, fontname='DejaVu Serif')  # Not bold
+plt.yticks(fontsize=14, fontname='DejaVu Serif')  # Not bold
+plt.tight_layout()
+plt.show()
+
+############################################################################################
+# PART 7: CREATING SAMPLE UNIVERSE
+############################################################################################
+
+# Create sample universe from the corrected merged dataset
+sample_universe = merged.copy()
+
+################################################################################################################
+# PART 7.1 - MODIFIED UNIVERSE SELECTION (INDUSTRY-FOCUSED LOGIC)
+# but the internal logic is changed to an industry-first selection based on the new proposal.
+################################################################################################################
+
+# Configuration (variable names unchanged as requested)
+MIN_STOCKS_PER_INDUSTRY = 10  # Minimum stocks per industry for deciles formation
+MARKET_CAP_THRESHOLD = 0.975   # For the NEW LOGIC within select_hybrid_universe:
+                                # this is the % market cap to capture WITHIN EACH INDUSTRY.
+
+def select_hybrid_universe(merged_data, threshold=MARKET_CAP_THRESHOLD, min_stocks_per_industry=MIN_STOCKS_PER_INDUSTRY):
+    """
+    Select stocks using an INDUSTRY-FOCUSED approach:
+    1. For each industry, select stocks that account for a specified percentage ('threshold')
+       of THAT INDUSTRY'S total market cap.
+    2. Then ensure each industry has a minimum number of stocks ('min_stocks_per_industry').
+    
+    
+    Parameters:
+    - merged_data: DataFrame with columns ['crsp_date', 'gic_sector', 'market_cap', ...]
+    - threshold: Percentage of each industry's market cap to include (e.g., 0.975 means top 97.5% of each industry's cap).
+                 Defaults to global MARKET_CAP_THRESHOLD.
+    - min_stocks_per_industry: Minimum stocks per industry. Defaults to global MIN_STOCKS_PER_INDUSTRY.
+    
+    Returns:
+    - DataFrame with selected stocks for each month
+    """
+    all_selected_stocks_for_month_list = [] # List to store DataFrames for each month's selection
+    
+    # Ensure crsp_date is datetime for grouping
+    merged_data['crsp_date'] = pd.to_datetime(merged_data['crsp_date'])
+
+    # Process each month separately
+    for date_obj, month_group_df in merged_data.groupby('crsp_date'):
+        if month_group_df.empty:
+            continue
+            
+        this_month_selected_industry_dfs = [] # List to store DFs, one DF per industry for this date
+        
+        # Process each industry within the month
+        for industry_name, industry_group_df_original in month_group_df.groupby('gic_sector', observed=True):
+            if industry_name == 'Other' or industry_group_df_original.empty:
+                continue
+
+            industry_group_df = industry_group_df_original.copy() # Work on a copy
+
+            # Sort stocks within the current industry by market cap
+            industry_sorted_df = industry_group_df.sort_values('market_cap', ascending=False)
+            
+            # Calculate cumulative market cap percentage for THIS INDUSTRY
+            industry_total_cap = industry_sorted_df['market_cap'].sum()
+            if industry_total_cap <= 0: 
+                continue
+
+            industry_sorted_df['cumulative_cap_industry'] = industry_sorted_df['market_cap'].cumsum()
+            industry_sorted_df['cumulative_pct_industry'] = industry_sorted_df['cumulative_cap_industry'] / industry_total_cap
+            
+            # Select top stocks until reaching the industry_threshold for THIS INDUSTRY
+            selected_by_cap_for_industry = industry_sorted_df[industry_sorted_df['cumulative_pct_industry'] <= threshold].copy()
+            
+            # Ensure minimum number of stocks per industry
+            if len(selected_by_cap_for_industry) < min_stocks_per_industry:
+                num_to_select_by_min = min(min_stocks_per_industry, len(industry_sorted_df))
+                final_selected_for_industry = industry_sorted_df.head(num_to_select_by_min).copy()
+            else:
+                final_selected_for_industry = selected_by_cap_for_industry
+            
+            this_month_selected_industry_dfs.append(final_selected_for_industry)
+        
+        if this_month_selected_industry_dfs:
+            month_combined_df = pd.concat(this_month_selected_industry_dfs)
+            all_selected_stocks_for_month_list.append(month_combined_df)
+            
+    if not all_selected_stocks_for_month_list:
+        # If no stocks were selected at all, return an empty DataFrame with the original columns
+        return pd.DataFrame(columns=merged_data.columns) 
+        
+    # Combine selections from all months
+    final_selected_df = pd.concat(all_selected_stocks_for_month_list, ignore_index=True)
+    
+    # Ensure global uniqueness for a stock on a given date, though prior logic should handle this.
+    # This mainly guards against issues if a stock could somehow be in multiple GICS sectors in source data (unlikely).
+    final_selected_df = final_selected_df.drop_duplicates(subset=['crsp_date', 'gvkey'], keep='first') # 'gvkey' should be unique per company
+    
+    return final_selected_df
+
+# --- Applying the selection methodology ---
+# This print statement now describes the new logic of select_hybrid_universe
+print(f"Applying MONTHLY industry-focused selection: top {MARKET_CAP_THRESHOLD*100}% market-cap PER INDUSTRY (using 'select_hybrid_universe' function name with new logic).")
+print(f"Minimum {MIN_STOCKS_PER_INDUSTRY} stocks per industry.")
+
+print(f"Initial dataset size passed to selection function: {len(merged):,} observations")
+
+# Create the sample universe with monthly rebalancing
+# The function select_hybrid_universe now contains the new industry-focused logic
+sample_universe = select_hybrid_universe(merged) # This call remains the same
+
+print(f"Selected universe size: {len(sample_universe):,} observations")
+if len(merged) > 0: # Avoid division by zero if merged is empty
+    print(f"Reduction from initial dataset: {(1 - len(sample_universe)/len(merged)):.1%}")
+else:
+    print("Reduction: N/A (initial dataset was empty or no stocks selected)")
+
+# Verify monthly rebalancing is working (This part of your script remains unchanged)
+print("\n" + "="*60)
+print("VERIFICATION: Monthly Rebalancing Check")
+print("="*60)
+
+# Check a specific stock's inclusion over time (example) - Use global dates for verification
+# Ensure sample_universe is not empty before proceeding
+if not sample_universe.empty:
+    sample_universe['crsp_date'] = pd.to_datetime(sample_universe['crsp_date']) # Ensure datetime type
+    # Use first year + 9 for verification dates to stay within analysis period
+    verification_start = ANALYSIS_START_DATE.replace(year=ANALYSIS_START_DATE.year + 9)
+    verification_end = verification_start.replace(month=12)
+    example_dates = pd.to_datetime(pd.date_range(verification_start, verification_end, freq='ME'))
+    for date_val in example_dates[:3]:  # Show first 3 months
+        # Compare date part only if crsp_date might have time components
+        # However, CRSP datadate is typically end-of-month, so direct comparison should work if types are aligned.
+        month_data = sample_universe[sample_universe['crsp_date'] == date_val]
+        if not month_data.empty:
+            n_stocks = len(month_data)
+            n_industries = month_data['gic_sector'].nunique()
+            print(f"{date_val.strftime('%Y-%m-%d')}: {n_stocks} stocks across {n_industries} industries")
+        else:
+            print(f"{date_val.strftime('%Y-%m-%d')}: No stocks in sample_universe for this month.")
+else:
+    print("Sample universe is empty. Skipping monthly rebalancing check.")
+
+
+# Summary statistics (This part of your script remains unchanged)
+print("\n" + "="*60)
+print("SUMMARY STATISTICS OF THE MODIFIED UNIVERSE") # Clarified title
+print("="*60)
+
+if not sample_universe.empty:
+    # Overall coverage - comparing to 'merged' as that was the input before any sector-specific exclusions like 'Other' or 'Financials'
+    # If you filtered financials before calling select_hybrid_universe, then total_unique_stocks_in_base should use that filtered df.
+    # For now, it uses the original 'merged' for this specific statistic.
+    base_for_total_unique = merged[merged['gic_sector'] != 'Other'].copy() # Consistent with your original summary
+    total_unique_stocks_in_base = base_for_total_unique['gvkey'].nunique()
+    selected_unique_stocks = sample_universe['gvkey'].nunique()
+    print(f"Total unique stocks in base data (gvkey, excl. Other): {total_unique_stocks_in_base:,}")
+    print(f"Selected unique stocks in new universe (gvkey): {selected_unique_stocks:,}")
+    if total_unique_stocks_in_base > 0:
+        print(f"Coverage of base data: {selected_unique_stocks/total_unique_stocks_in_base:.1%}")
+
+    # Industry-level summary
+    print("\nAverage monthly stocks by industry in new universe:")
+    sample_universe['crsp_date'] = pd.to_datetime(sample_universe['crsp_date']) # Ensure datetime type
+    monthly_avg = (sample_universe.groupby([pd.Grouper(key='crsp_date', freq='ME'), 'gic_sector'], observed=True) # Using Grouper for robust month grouping
+                   .size()
+                   .groupby('gic_sector', observed=True) 
+                   .mean()
+                   .sort_values(ascending=False))
+
+    for industry, avg_stocks in monthly_avg.items():
+        print(f"  {industry:<25} {avg_stocks:>6.1f} stocks/month")
+else:
+    print("Sample universe is empty. Skipping summary statistics.")
+
+print("\n✓ Monthly ranking and selection (with new industry-focused logic in select_hybrid_universe) completed successfully")
+
+################################################################################################################
+# VISUALIZE % OF MONTHS WHERE VALUE DECILES CAN BE FORMED BY SECTOR
+################################################################################################################
+
+def check_decile_feasibility_by_sector(data, min_required_for_deciles=10):
+    """Check if each sector-month has enough stocks with valid B/M for decile formation"""
+    results = []
+    
+    for (date, sector), group in data.groupby(['crsp_date', 'gic_sector'], observed=True):
+        valid_bm = group['bm'].notna() & (group['bm'] > 0) & (~np.isinf(group['bm']))
+        stocks_with_bm = valid_bm.sum()
+        
+        results.append({
+            'date': date,
+            'sector': sector,
+            'stocks_with_bm': stocks_with_bm,
+            'can_form_deciles': stocks_with_bm >= min_required_for_deciles
+        })
+    
+    return pd.DataFrame(results)
+
+# Filter sample universe to analysis period and run check
+sample_universe_analysis = sample_universe[
+    (sample_universe['crsp_date'] >= ANALYSIS_START_DATE) &
+    (sample_universe['crsp_date'] <= ANALYSIS_END_DATE)
+].copy()
+
+bm_availability = check_decile_feasibility_by_sector(sample_universe_analysis)
+pct_can_form = bm_availability.groupby('sector')['can_form_deciles'].mean().sort_values()
+
+# Create visualization
+plt.figure(figsize=(12, 8))
+ax = pct_can_form.plot(kind='barh', color='green', width=0.7)
+ax.set_xlabel('Percentage of Months', fontsize=14)
+ax.set_ylabel('Sector', fontsize=14)
+ax.set_title(f'% of Months Where Value Deciles Can Be Formed ({ANALYSIS_START_DATE.year}-{ANALYSIS_END_DATE.year})', fontsize=16, pad=20)
+ax.set_xlim(0, 1.2)
+ax.grid(True, axis='x', alpha=0.3)
+ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1f}'))
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.show()
+
+################################################################################################################
+# PART 8: GROUPING INTO SECTOR-LEVEL DATAFRAMES
+################################################################################################################
+
+print("\n" + "="*120)
+print("PART 8: CREATING SECTOR-LEVEL DATAFRAMES")
+print("="*120)
+
+# Use global analysis period configuration
+snapshot_start_date = ANALYSIS_START_DATE
+snapshot_end_date = ANALYSIS_END_DATE
+analysis_start_date = ANALYSIS_START_DATE
+analysis_end_date = ANALYSIS_END_DATE
+
+print(f"Analysis Period: {analysis_start_date.date()} to {analysis_end_date.date()}")
+
+# Filter merged data to match the analysis period
+analysis_df = merged[
+    (merged["crsp_date"] >= analysis_start_date) &
+    (merged["crsp_date"] <= analysis_end_date)
+].copy()
+
+print(f"Total observations in analysis period: {len(analysis_df):,}")
+
+# Check what columns are available in merged data
+available_columns = ["gic_sector", "gvkey", "crsp_date", "market_cap"]  # Required columns
+optional_columns = ["conm", "tic", "trt1m", "bm", "has_valid_bm"]  # Optional columns
+
+# Add optional columns if they exist
+for col in optional_columns:
+    if col in merged.columns:
+        available_columns.append(col)
+
+print("\nColumns being used:", available_columns)
+
+# Select relevant columns
+industry_data = analysis_df[available_columns].copy()
+
+# Drop rows where sector is 'Other' or missing
+industry_data = industry_data[
+    (industry_data["gic_sector"].notna()) & 
+    (industry_data["gic_sector"] != "Other")
+]
+
+print(f"Observations after removing 'Other' sector: {len(industry_data):,}")
+
+# Get list of unique sectors
+gics_sectors = sorted(industry_data["gic_sector"].unique())
+print(f"\nNumber of GICS sectors: {len(gics_sectors)}")
+print("Sectors included:", gics_sectors)
+
+################################################################################################################
+# CREATE SECTOR-SPECIFIC DATAFRAMES
+################################################################################################################
+
+print("\n" + "-"*80)
+print("Creating sector-specific DataFrames...")
+print("-"*80)
+
+# Create dictionary of sector-specific DataFrames
+industry_dfs = {}
+sector_stats = []
+
+for sector in gics_sectors:
+    # Filter for this sector
+    sector_df = industry_data[industry_data["gic_sector"] == sector].copy()
+    
+    # Apply the hybrid universe selection to this sector
+    sector_df = select_hybrid_universe(sector_df)
+    
+    # Sort by company and date
+    sector_df = sector_df.sort_values(by=["gvkey", "crsp_date"]).reset_index(drop=True)
+    
+    # Store in dictionary only if we have data
+    if not sector_df.empty:
+        industry_dfs[sector] = sector_df
+        
+        # Calculate statistics for this sector
+        unique_companies = sector_df["gvkey"].nunique()
+        total_observations = len(sector_df)
+        date_range_start = sector_df["crsp_date"].min()
+        date_range_end = sector_df["crsp_date"].max()
+        
+        sector_stats.append({
+            "Sector": sector,
+            "Unique_Companies": unique_companies,
+            "Total_Observations": total_observations,
+            "Start_Date": date_range_start,
+            "End_Date": date_range_end
+        })
+        
+        print(f"  {sector}: {unique_companies:,} unique companies, {total_observations:,} observations")
+    else:
+        print(f"  {sector}: No companies met selection criteria")
+
+# Convert statistics to DataFrame
+sector_stats_df = pd.DataFrame(sector_stats)
+
+################################################################################################################
+# DIAGNOSTICS AND SUMMARY STATISTICS
+################################################################################################################
+
+print("\n" + "="*120)
+print("SECTOR-LEVEL SUMMARY STATISTICS")
+print("="*120)
+
+if not sector_stats_df.empty:
+    # Display sector statistics sorted by number of companies
+    print(sector_stats_df.sort_values("Unique_Companies", ascending=False).to_string(index=False))
+
+    # Calculate unique company counts per sector for selected universe
+    sector_counts = pd.DataFrame([
+        {
+            "gic_sector": sector,
+            "unique_company_count": df["gvkey"].nunique()
+        }
+        for sector, df in industry_dfs.items()
+    ]).sort_values(by="unique_company_count", ascending=False)
+
+    # === Snapshot: Market Cap on snapshot_end_date ===
+    snapshot_companies = []
+    for sector_df in industry_dfs.values():
+        if snapshot_end_date in sector_df["crsp_date"].values:
+            snapshot_companies.append(
+                sector_df[sector_df["crsp_date"] == snapshot_end_date]
+            )
+    
+    if snapshot_companies:
+        snapshot_df = pd.concat(snapshot_companies)
+        
+        # Get top 10 by market cap with company names and tickers
+        top10_columns = ["gvkey", "gic_sector", "crsp_date", "market_cap"]
+        if "conm" in snapshot_df.columns:
+            top10_columns.insert(1, "conm")
+        if "tic" in snapshot_df.columns:
+            top10_columns.insert(2, "tic")
+        
+        top10_snapshot = (
+            snapshot_df[top10_columns]
+            .dropna(subset=["market_cap"])
+            .sort_values(by="market_cap", ascending=False)
+            .head(10)
+        )
+        
+        # Format market cap in billions for readability
+        top10_snapshot_display = top10_snapshot.copy()
+        top10_snapshot_display['market_cap_billions'] = (top10_snapshot_display['market_cap'] / 1000).round(2)
+        top10_snapshot_display = top10_snapshot_display.drop('market_cap', axis=1)
+        
+        print("\n" + "="*120)
+        print(f"TOP 10 FIRMS BY MARKET CAP AS OF {snapshot_end_date.date()}")
+        print("="*120)
+        print(top10_snapshot_display.to_string(index=False))
+
+    # === Total Unique Firms Across All Sectors ===
+    total_unique = sector_counts["unique_company_count"].sum()
+    print("\n" + "="*120)
+    print(f"TOTAL UNIQUE COMPANIES: {total_unique:,} across {len(industry_dfs)} GICS sectors")
+    print("="*120)
+
+    # === Decile Formation Feasibility by Sector ===
+    print("\nDecile Formation Feasibility by Sector:")
+    print("-" * 80)
+    print(f"{'Sector':<30} {'Min Monthly Stocks':<20} {'Deciles Possible':<20} {'All Months Feasible':<20}")
+    print("-" * 80)
+
+    decile_feasibility = []
+
+    for sector, sector_data in industry_dfs.items():
+        # Check decile feasibility for each month
+        monthly_feasibility = []
+        
+        for date in sector_data['crsp_date'].unique():
+            month_data = sector_data[sector_data['crsp_date'] == date]
+            
+            # Count stocks with valid B/M for this month
+            if 'has_valid_bm' in month_data.columns:
+                stocks_with_bm = month_data['has_valid_bm'].sum()
+            elif 'bm' in month_data.columns:
+                stocks_with_bm = month_data['bm'].notna().sum()
+            else:
+                stocks_with_bm = len(month_data)  # If no B/M info, assume all stocks are valid
+            
+            # Check if we can form deciles (need at least 10 stocks with B/M)
+            can_form_deciles = stocks_with_bm >= 10
+            monthly_feasibility.append(can_form_deciles)
+        
+        # Calculate statistics
+        min_monthly_stocks = sector_data.groupby('crsp_date')['gvkey'].nunique().min()
+        all_months_feasible = all(monthly_feasibility) if monthly_feasibility else False
+        pct_months_feasible = sum(monthly_feasibility) / len(monthly_feasibility) * 100 if monthly_feasibility else 0
+        
+        # Display results
+        feasible_text = "YES" if all_months_feasible else f"NO ({pct_months_feasible:.1f}% of months)"
+        print(f"{sector:<30} {min_monthly_stocks:<20} {'YES' if min_monthly_stocks >= 10 else 'NO':<20} {feasible_text:<20}")
+        
+        decile_feasibility.append({
+            'Sector': sector,
+            'Min_Monthly_Stocks': min_monthly_stocks,
+            'All_Months_Feasible': all_months_feasible,
+            'Percent_Months_Feasible': pct_months_feasible
+        })
+
+    # Summary
+    decile_df = pd.DataFrame(decile_feasibility)
+    feasible_count = decile_df['All_Months_Feasible'].sum()
+    print("\n" + "-" * 80)
+    print(f"SUMMARY: {feasible_count} out of {len(industry_dfs)} sectors can form deciles in ALL months")
+    print("-" * 80)
+
+# === Configuration Reminder ===
+print("\n" + "="*120)
+print("CONFIGURATION USED:")
+print("="*120)
+print(f"• Market Cap Threshold: {MARKET_CAP_THRESHOLD*100}%")
+print(f"• Minimum Stocks per Industry: {MIN_STOCKS_PER_INDUSTRY}")
+print(f"• Analysis Period: {analysis_start_date.date()} to {analysis_end_date.date()}")
+
+print("\n" + "="*120)
+print("SECTOR-LEVEL DATAFRAMES CREATED SUCCESSFULLY")
+print("="*120)
+print("\nAccess sector data using: industry_dfs['sector_name']")
+print("Example: industry_dfs['Financials'] or industry_dfs['Information Technology']")
+print(f"\nTotal sectors available: {len(industry_dfs)}")
+print("Sectors:", list(industry_dfs.keys()))
+
+###################################################################
+######################### SANITY CHECK ############################
+###################################################################
+
+# Set the ticker to check
+ticker_to_check = "NVDA"  # Change this to any ticker of interest
+
+# Filter the sample_universe dataset for the ticker and date range
+ticker_info_subset = (
+    sample_universe[
+        (sample_universe["tic"].str.upper() == ticker_to_check.upper()) &
+        (sample_universe["crsp_date"] >= "2019-01-01") &
+        (sample_universe["crsp_date"] <= "2019-7-31")
+    ][["tic", "crsp_date", "gic_sector", "bm", "trt1m"]]
+    .dropna(subset=["bm", "trt1m"])
+    .sort_values(by="crsp_date")
+)
+
+# Print the result
+print(f"\nB/M ratio and return history for ticker '{ticker_to_check.upper()}' from 2019-08 to 2019-12:")
+print(ticker_info_subset)
+
+################################################################################################################
+# NUMBER OF FIRMS PER SECTOR OVER TIME FROM SAMPLE UNIVERSE
+################################################################################################################
+
+# Set up visualization
+style.use('seaborn-v0_8-whitegrid')
+
+# Set font to Palatino
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Palatino', 'Times New Roman', 'serif']
+
+start_plot_date = pd.Timestamp('1981-01-01')
+end_plot_date = pd.Timestamp('2022-01-31')
+
+# Calculate monthly firm counts per sector
+sample_universe_filtered = sample_universe[sample_universe['gic_sector'] != 'Other']
+monthly_sector_counts = sample_universe_filtered.groupby(['crsp_date', 'gic_sector'], observed=True)['gvkey'].nunique()
+sector_counts_over_time = monthly_sector_counts.unstack(level='gic_sector', fill_value=0)
+
+sector_counts_to_plot = sector_counts_over_time[
+    (sector_counts_over_time.index >= start_plot_date) &
+    (sector_counts_over_time.index <= end_plot_date)
+].copy()
+
+# Define sector colors
+sector_colors = {
+    'Financials': '#E41A1C', 'Consumer Discretionary': '#377EB8', 'Information Technology': '#4D4D4D',
+    'Industrials': '#FFD700', 'Health Care': '#4DAF4A', 'Materials': '#F781BF', 'Real Estate': '#A65628',
+    'Energy': '#FF7F00', 'Consumer Staples': '#984EA3', 'Utilities': '#66C2A5', 'Communication Services': '#E6AB02'
+}
+
+# Create visualization
+plt.figure(figsize=(16, 10))
+for sector in sector_counts_to_plot.columns:
+    plt.plot(sector_counts_to_plot.index, sector_counts_to_plot[sector], linewidth=2, color=sector_colors[sector])
+
+threshold_pct = MARKET_CAP_THRESHOLD * 100
+plt.xlabel("Date", fontsize=14)
+plt.ylabel("Number of Firms in Sample Universe", fontsize=14)
+plt.title(f"Sample Universe: Number of Firms per Sector Over Time (January 1981 to May 2022)\n(Criteria: {threshold_pct:.1f}% Market Cap Threshold or Minimum {MIN_STOCKS_PER_INDUSTRY} Stocks per Industry)", fontsize=16, pad=20)
+plt.grid(True, alpha=0.3)
+
+legend_patches = [mpatches.Patch(color=sector_colors[sector], label=sector) for sector in sector_counts_to_plot.columns]
+plt.legend(handles=legend_patches, title="GICS Sector", bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0., fontsize=12, title_fontsize=13)
+plt.ylim(bottom=0)
+
+years = range(1985, 2025, 5)
+plt.xticks([pd.Timestamp(f'{year}-01-01') for year in years], [str(year) for year in years], fontsize=12)
+plt.yticks(fontsize=12)
+plt.tight_layout(rect=[0, 0, 0.88, 1])
+plt.show()
+
+# Summary statistics
+print(f"\nSample Universe Summary Statistics (Threshold: {threshold_pct:.1f}%, Min Stocks: {MIN_STOCKS_PER_INDUSTRY}):")
+print("="*80)
+avg_firms = sector_counts_to_plot.mean().sort_values(ascending=False)
+for sector in avg_firms.index:
+    min_firms = sector_counts_to_plot[sector].min()
+    max_firms = sector_counts_to_plot[sector].max()
+    print(f"{sector:30} Avg: {int(avg_firms[sector]):>6}  Min: {min_firms:>4.0f}  Max: {max_firms:>4.0f}")
+print("="*80)
+print(f"Total Average Firms in Sample Universe: {int(avg_firms.sum()):>6}")
+
+print("\n" + "="*80)
+print("SAMPLE UNIVERSE DEFINITION VERIFICATION:")
+print("="*80)
+print(f"• Market Cap Threshold: {MARKET_CAP_THRESHOLD} ({threshold_pct:.1f}%)")
+print(f"• Minimum Stocks per Industry: {MIN_STOCKS_PER_INDUSTRY}")
+print("="*80)
+
+################################################################################################################
+# SAMPLE UNIVERSE: MARKET COMPOSITION BY SECTOR OVER TIME (% OF TOTAL MARKET CAP)
+################################################################################################################
+
+# Use a visually appealing style
+style.use('seaborn-v0_8-whitegrid')
+
+# Set font to Palatino
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Palatino', 'Times New Roman', 'serif']
+
+# Define consistent sector colors for both charts
+sector_colors = {
+    # High Range sectors
+    'Financials': '#E41A1C',              # Bright crimson red
+    
+    # Mid-High Range sectors
+    'Consumer Discretionary': '#377EB8',   # Strong blue
+    'Information Technology': '#4D4D4D',   # Dark gray
+    'Industrials': '#FFD700',             # Gold
+    'Health Care': '#4DAF4A',             # Vibrant green
+    
+    # Mid Range sectors
+    'Materials': '#F781BF',               # Light pink
+    'Real Estate': '#A65628',             # Brown
+    'Energy': '#FF7F00',                  # Bright orange
+    
+    # Low Range sectors
+    'Consumer Staples': '#984EA3',        # Purple
+    'Utilities': '#66C2A5',               # Teal
+    'Communication Services': '#E6AB02'    # Amber/gold
+}
+
+# Calculate total market cap per sector per date
+market_cap_by_sector = sample_universe_filtered.groupby(['crsp_date', 'gic_sector'], observed=True)['market_cap'].sum()
+
+# Calculate the total market cap per date
+total_market_cap = sample_universe_filtered.groupby('crsp_date')['market_cap'].sum()
+
+# Calculate sector percentages
+sector_percentages = (market_cap_by_sector.unstack(level='gic_sector', fill_value=0)
+                     .div(total_market_cap, axis=0) * 100)
+
+# Also prepare absolute market cap data in billions
+sector_market_cap = market_cap_by_sector.unstack(level='gic_sector', fill_value=0)
+sector_market_cap_billions = sector_market_cap / 1000  # Convert to billions (assuming market_cap is in millions)
+
+# Filter data for the plot period
+sector_percentages_to_plot = sector_percentages[
+    (sector_percentages.index >= start_plot_date) &
+    (sector_percentages.index <= end_plot_date)
+].copy()
+
+sector_market_cap_to_plot = sector_market_cap_billions[
+    (sector_market_cap_billions.index >= start_plot_date) &
+    (sector_market_cap_billions.index <= end_plot_date)
+].copy()
+
+# Convert threshold to percentage for display
+threshold_pct = MARKET_CAP_THRESHOLD * 100
+
+# ========================================
+# SAMPLE UNIVERSE PERCENTAGE MARKET SHARE
+# ========================================
+
+# Create the line plot for percentages
+plt.figure(figsize=(16, 10))
+
+# Plot each sector's market share over time as separate lines
+for sector in sector_percentages_to_plot.columns:
+    plt.plot(sector_percentages_to_plot.index, 
+             sector_percentages_to_plot[sector], 
+             linewidth=2,
+             color=sector_colors[sector])
+
+# Customize the plot - USE ACTUAL VARIABLE VALUES IN TITLE
+plt.xlabel("Date", fontsize=14)
+plt.ylabel("Sample Universe Market Share (%)", fontsize=14)
+plt.title(f"Sample Universe: Market Composition (%) by Sector Over Time  (January 1981 to May 2022)\n(Criteria: {threshold_pct:.1f}% Market Cap Threshold or Minimum {MIN_STOCKS_PER_INDUSTRY} Stocks per Industry)", 
+          fontsize=16, pad=20)
+
+# Add grid for better readability
+plt.grid(True, alpha=0.3)
+
+# Create custom legend with colored boxes instead of lines
+legend_patches = []
+for sector in sector_percentages_to_plot.columns:
+    patch = mpatches.Patch(color=sector_colors[sector], label=sector)
+    legend_patches.append(patch)
+
+# Add legend with colored boxes
+plt.legend(handles=legend_patches,
+          title="GICS Sector", 
+          bbox_to_anchor=(1.02, 1), 
+          loc='upper left', 
+          borderaxespad=0.,
+          fontsize=12,
+          title_fontsize=13)
+
+# Set y-axis limits
+plt.ylim(0, max(sector_percentages_to_plot.max()) * 1.05)  # Add 5% padding at top
+
+# Format x-axis
+years = range(1985, 2025, 5)
+plt.xticks([pd.Timestamp(f'{year}-01-01') for year in years], 
+           [str(year) for year in years],
+           fontsize=12)
+plt.yticks(fontsize=12)
+
+# Final adjustments
+plt.tight_layout(rect=[0, 0, 0.88, 1])
+
+# Show the plot
+plt.show()
+
+# Print summary statistics for percentages with actual threshold values
+print(f"\nSample Universe Summary Statistics (Threshold: {threshold_pct:.1f}%, Min Stocks: {MIN_STOCKS_PER_INDUSTRY}) - Average Market Share (%) per Sector:")
+print("="*80)
+avg_share = sector_percentages_to_plot.mean().sort_values(ascending=False)
+for sector in avg_share.index:
+    min_share = sector_percentages_to_plot[sector].min()
+    max_share = sector_percentages_to_plot[sector].max()
+    print(f"{sector:30} Avg: {avg_share[sector]:>6.2f}%  Min: {min_share:>6.2f}%  Max: {max_share:>6.2f}%")
+print("="*80)
+print(f"Total Average Share in Sample Universe: {avg_share.sum():>6.2f}%")
+
+################################################################################################################
+# SAMPLE UNIVERSE: ABSOLUTE MARKET CAP BY SECTOR OVER TIME ($ BILLIONS)
+################################################################################################################
+
+# Create the line plot for absolute values
+plt.figure(figsize=(16, 10))
+
+# Plot each sector's absolute market cap over time as separate lines
+for sector in sector_market_cap_to_plot.columns:
+    plt.plot(sector_market_cap_to_plot.index, 
+             sector_market_cap_to_plot[sector], 
+             linewidth=2,
+             color=sector_colors[sector])
+
+# Customize the plot - USE ACTUAL VARIABLE VALUES IN TITLE
+plt.xlabel("Date", fontsize=14)
+plt.ylabel("Sample Universe Market Cap ($ Billions)", fontsize=14)
+plt.title(f"Sample Universe: Absolute Market Cap by GICS Sector ({start_plot_date.year}-{start_plot_date.strftime('%m')} to {end_plot_date.year}-{end_plot_date.strftime('%m')}, $ Billions)\n(Sample Universe Criteria: {threshold_pct:.1f}% Market Cap Threshold or Minimum {MIN_STOCKS_PER_INDUSTRY} Stocks per Industry)", 
+          fontsize=16, pad=20)
+
+# Add grid for better readability
+plt.grid(True, alpha=0.3)
+
+# Create custom legend with colored boxes instead of lines
+legend_patches_abs = []
+for sector in sector_market_cap_to_plot.columns:
+    patch = mpatches.Patch(color=sector_colors[sector], label=sector)
+    legend_patches_abs.append(patch)
+
+# Add legend with colored boxes
+plt.legend(handles=legend_patches_abs,
+          title="GICS Sector", 
+          bbox_to_anchor=(1.02, 1), 
+          loc='upper left', 
+          borderaxespad=0.,
+          fontsize=12,
+          title_fontsize=13)
+
+# Set y-axis to start from 0
+plt.ylim(bottom=0)
+
+# Format x-axis
+plt.xticks([pd.Timestamp(f'{year}-01-01') for year in years], 
+           [str(year) for year in years],
+           fontsize=12)
+plt.yticks(fontsize=12)
+
+# Final adjustments
+plt.tight_layout(rect=[0, 0, 0.88, 1])
+
+# Show the plot
+plt.show()
+
+# Print summary statistics for absolute values with actual threshold values
+print(f"\nSample Universe Summary Statistics (Threshold: {threshold_pct:.1f}%, Min Stocks: {MIN_STOCKS_PER_INDUSTRY}) - Average Market Cap ($ Billions) per Sector:")
+print("="*80)
+avg_market_cap = sector_market_cap_to_plot.mean().sort_values(ascending=False)
+for sector in avg_market_cap.index:
+    min_cap = sector_market_cap_to_plot[sector].min()
+    max_cap = sector_market_cap_to_plot[sector].max()
+    print(f"{sector:30} Avg: ${avg_market_cap[sector]:>8.1f}B  Min: ${min_cap:>8.1f}B  Max: ${max_cap:>8.1f}B")
+print("="*80)
+print(f"Total Average Market Cap in Sample Universe: ${avg_market_cap.sum():>8.1f}B")
+
+# Print the actual threshold values being used for verification
+print("\n" + "="*80)
+print("SAMPLE UNIVERSE DEFINITION VERIFICATION:")
+print("="*80)
+print(f"• Market Cap Threshold: {MARKET_CAP_THRESHOLD} ({threshold_pct:.1f}%)")
+print(f"• Minimum Stocks per Industry: {MIN_STOCKS_PER_INDUSTRY}")
+print("="*80)
+
+################################################################################################################
+# MARKET CAPITALIZATION SHARE ANALYSIS: SAMPLE VS TOTAL US MARKET
+################################################################################################################
+
+# Set analysis period from global variables
+start_date = ANALYSIS_START_DATE
+end_date = ANALYSIS_END_DATE
+
+# Ensure dates are in datetime format for filtering
+sample_universe['crsp_date'] = pd.to_datetime(sample_universe['crsp_date'])
+US_Stock_Market['crsp_date'] = pd.to_datetime(US_Stock_Market['crsp_date'])
+
+# Calculate total market cap of our sample universe by month (excluding 'Other' sector)
+sample_monthly_mktcap = sample_universe[
+    (sample_universe["crsp_date"] >= start_date) &
+    (sample_universe["crsp_date"] <= end_date) &
+    (sample_universe["gic_sector"] != "Other")
+].groupby("crsp_date")["market_cap"].sum().rename("sample_mkt_cap")
+
+# Calculate total market cap of entire US stock market by month
+total_monthly_mktcap = US_Stock_Market[
+    (US_Stock_Market["crsp_date"] >= start_date) &
+    (US_Stock_Market["crsp_date"] <= end_date)
+].groupby("crsp_date")["market_cap"].sum().rename("total_mkt_cap")
+
+# Combine data and calculate market share percentage
+market_share = pd.DataFrame({'sample_mkt_cap': sample_monthly_mktcap, 'total_mkt_cap': total_monthly_mktcap})
+market_share['mkt_cap_share'] = (market_share['sample_mkt_cap'] / market_share['total_mkt_cap']) * 100
+
+# Calculate summary statistics
+total_unique_stocks_sample = sample_universe["gvkey"].nunique()
+total_unique_stocks_universe = US_Stock_Market["gvkey"].nunique()
+
+avg_share_pct = market_share['mkt_cap_share'].mean()
+min_share = market_share['mkt_cap_share'].min() / 100
+max_share = market_share['mkt_cap_share'].max() / 100
+
+# Set up chart parameters
+data_min = market_share['mkt_cap_share'].min()
+data_max = market_share['mkt_cap_share'].max()
+y_padding = (data_max - data_min) * 0.05
+
+threshold_pct = MARKET_CAP_THRESHOLD * 100
+
+# Create time series visualization of market share
+plt.figure(figsize=(16, 8))
+plt.plot(market_share.index, market_share['mkt_cap_share'], color='blue', linewidth=2, label='Sample Universe Market Cap Share')
+plt.axhline(y=avg_share_pct, color='red', linestyle='--', linewidth=2, label=f'Average ({avg_share_pct:.2f}%)')
+plt.title(f'Market Cap of the Sample Universe As a Percentage of the Total US Stock Market\n(Sample Universe Criteria: {threshold_pct:.1f}% Market Cap Threshold, Min {MIN_STOCKS_PER_INDUSTRY} Stocks per Industry)', fontsize=16, pad=20)
+plt.xlabel('Date', fontsize=14)
+plt.ylabel('Sample Universe Market Cap as % of Total US Stock Market', fontsize=14)
+plt.grid(True, alpha=0.3)
+plt.ylim(data_min - y_padding, data_max + y_padding)
+
+years = range(1980, 2021, 5)
+plt.xticks([pd.Timestamp(f'{year}-01-01') for year in years], [str(year) for year in years], fontsize=12)
+plt.legend(fontsize=12, loc='best')
+plt.tight_layout()
+plt.show()
+
+# Display comprehensive summary statistics
+print("=" * 80)
+print(f"Sample Universe Market Cap Share Summary (Threshold: {threshold_pct:.1f}%, Min Stocks: {MIN_STOCKS_PER_INDUSTRY})")
+print(f"Analysis Period: {start_date.strftime('%Y-%m')} to {end_date.strftime('%Y-%m')}")
+print("=" * 80)
+print(f"• Unique stocks in FINAL sample universe:        {total_unique_stocks_sample}")
+print(f"• Unique stocks in total universe (CRSP+Comp):   {total_unique_stocks_universe}")
+print(f"• Average % of Sample Universe Market Cap Relative to Total US Stock Market: {avg_share_pct/100:.2%}")
+print(f"• Minimum market cap share:                        {min_share:.2%}")
+print(f"• Maximum market cap share:                        {max_share:.2%}")
+print("=" * 80)
+
+################################################################################################################
+# DATASET AND METHODOLOGY SUMMARY STATISTICS
+################################################################################################################
+
+def print_section_header(title, width=100):
+    print("\n" + "="*width)
+    print(f"{title:^{width}}")
+    print("="*width)
+
+def print_subsection_header(title):
+    print(f"\n{title}")
+    print("-" * len(title))
+
+def print_stat_line(label, value, label_width=60):
+    print(f"{label:<{label_width}} : {value}")
+
+print_section_header("DATASET AND METHODOLOGY SUMMARY STATISTICS")
+
+# Use global analysis period
+analysis_start_date = ANALYSIS_START_DATE
+analysis_end_date = ANALYSIS_END_DATE
+
+# Filter datasets to analysis period
+sample_universe_filtered = sample_universe[
+    (sample_universe['crsp_date'] >= analysis_start_date) & 
+    (sample_universe['crsp_date'] <= analysis_end_date)
+].copy()
+
+US_Stock_Market_filtered = US_Stock_Market[
+    (US_Stock_Market['crsp_date'] >= analysis_start_date) & 
+    (US_Stock_Market['crsp_date'] <= analysis_end_date)
+].copy()
+
+# Calculate actual date range
+if not sample_universe_filtered.empty:
+    actual_start_date = sample_universe_filtered['crsp_date'].min()
+    actual_end_date = sample_universe_filtered['crsp_date'].max()
+else:
+    actual_start_date = pd.NaT
+    actual_end_date = pd.NaT
+
+print_subsection_header("ANALYSIS PERIOD")
+start_str = actual_start_date.strftime('%Y-%m-%d') if pd.notnull(actual_start_date) else 'N/A'
+end_str = actual_end_date.strftime('%Y-%m-%d') if pd.notnull(actual_end_date) else 'N/A'
+print_stat_line("Full Analysis Period", f"{start_str} to {end_str}")
+print_stat_line("Specified Analysis Window", f"{analysis_start_date.strftime('%Y-%m-%d')} to {analysis_end_date.strftime('%Y-%m-%d')}")
+
+# Sample Universe Characteristics
+print_subsection_header("SAMPLE UNIVERSE CHARACTERISTICS")
+
+if not sample_universe_filtered.empty:
+    total_unique_gvkeys = sample_universe_filtered['gvkey'].nunique()
+    total_firm_months = len(sample_universe_filtered)
+    avg_firms_per_month_sample = sample_universe_filtered.groupby('crsp_date')['gvkey'].nunique().mean()
+    
+    # GICS sectors analysis
+    temp_sample_for_sector_count = sample_universe_filtered[sample_universe_filtered['gic_sector'] != 'Other']
+    avg_sectors_per_month = temp_sample_for_sector_count.groupby('crsp_date')['gic_sector'].nunique().mean()
+
+    # Market Cap Coverage calculation
+    sample_monthly_mktcap = sample_universe_filtered.groupby('crsp_date')['market_cap'].sum()
+    total_us_monthly_mktcap = US_Stock_Market_filtered.groupby('crsp_date')['market_cap'].sum()
+    
+    market_share_df = pd.DataFrame({'sample_cap': sample_monthly_mktcap, 'total_cap': total_us_monthly_mktcap}).dropna()
+    if not market_share_df.empty and (market_share_df['total_cap'] > 0).any():
+        market_share_df['share'] = market_share_df['sample_cap'] / market_share_df['total_cap']
+        avg_market_cap_coverage = market_share_df['share'].mean()
+    else:
+        avg_market_cap_coverage = np.nan
+
+    # Firm characteristics (removed median, kept mean)
+    sample_universe_filtered['market_cap_numeric'] = pd.to_numeric(sample_universe_filtered['market_cap'], errors='coerce')
+    sample_universe_filtered['bm_numeric'] = pd.to_numeric(sample_universe_filtered['bm'], errors='coerce')
+
+    mean_firm_market_cap_sample = sample_universe_filtered['market_cap_numeric'].mean()
+    mean_bm_sample = sample_universe_filtered[sample_universe_filtered['bm_numeric'] > 0]['bm_numeric'].mean()
+
+    # Print statistics
+    print_stat_line("Total Unique Firms (GVKEYs)", f"{total_unique_gvkeys:,}")
+    print_stat_line("Total Firm-Month Observations", f"{total_firm_months:,}")
+    print_stat_line("Average Number of Firms per Month", f"{avg_firms_per_month_sample:,.1f}" if pd.notnull(avg_firms_per_month_sample) else "N/A")
+    print_stat_line("Average Number of GICS Sectors per Month (Excl. 'Other')", f"{avg_sectors_per_month:,.1f}" if pd.notnull(avg_sectors_per_month) else "N/A")
+    print_stat_line("Average Market Cap Coverage (% of Total US Market)", f"{avg_market_cap_coverage:.2%}" if pd.notnull(avg_market_cap_coverage) else "N/A")
+    print_stat_line("Mean Firm Market Cap ($ Millions)", f"${mean_firm_market_cap_sample:,.2f}" if pd.notnull(mean_firm_market_cap_sample) else "N/A")
+    print_stat_line("Mean Book-to-Market (B/M) Ratio (for B/M > 0)", f"{mean_bm_sample:.3f}" if pd.notnull(mean_bm_sample) else "N/A")
+else:
+    print_stat_line("Sample Universe Status", "EMPTY - No data available")
+
+# Sample Universe Selection Methodology
+print_subsection_header("SAMPLE UNIVERSE SELECTION METHODOLOGY")
+threshold_pct = MARKET_CAP_THRESHOLD * 100
+print_stat_line("Industry Market Cap Threshold for Selection", f"{threshold_pct:.1f}% (within each industry)")
+print_stat_line("Minimum Stocks per Industry in Selection", f"{MIN_STOCKS_PER_INDUSTRY}")
+
+# Total Universe Statistics
+print_subsection_header("TOTAL US STOCK MARKET UNIVERSE (CRSP+Compustat)")
+
+if not US_Stock_Market_filtered.empty:
+    total_unique_stocks_universe = US_Stock_Market_filtered['gvkey'].nunique()
+    total_firm_months_universe = len(US_Stock_Market_filtered)
+    avg_firms_per_month_universe = US_Stock_Market_filtered.groupby('crsp_date')['gvkey'].nunique().mean()
+    
+    print_stat_line("Total Unique Firms (GVKEYs)", f"{total_unique_stocks_universe:,}")
+    print_stat_line("Total Firm-Month Observations", f"{total_firm_months_universe:,}")
+    print_stat_line("Average Number of Firms per Month", f"{avg_firms_per_month_universe:,.1f}" if pd.notnull(avg_firms_per_month_universe) else "N/A")
+else:
+    print_stat_line("Total Universe Status", "EMPTY - No data available")
+
+# Detailed sector-level analysis
+if not sample_universe_filtered.empty:
+    print_subsection_header("SECTOR-LEVEL ANALYSIS")
+    
+    # Monthly firm count analysis by sector
+    sector_analysis = []
+    for sector_name, sector_df in sample_universe_filtered.groupby('gic_sector', observed=True):
+        if sector_name == 'Other':
+            continue
+        
+        monthly_counts = sector_df.groupby('crsp_date')['gvkey'].nunique()
+        min_count = monthly_counts.min()
+        max_count = monthly_counts.max()
+        avg_count = monthly_counts.mean()
+        
+        months_below_min = (monthly_counts < MIN_STOCKS_PER_INDUSTRY).sum()
+        total_months = sector_df['crsp_date'].nunique()
+        pct_below_min = (months_below_min / total_months * 100) if total_months > 0 else 0
+        
+        sector_analysis.append({
+            'Sector': sector_name,
+            'Avg_Firms': f"{avg_count:.1f}",
+            'Min_Firms': min_count,
+            'Max_Firms': max_count,
+            'Pct_Below_Min': f"{pct_below_min:.1f}%"
+        })
+    
+    print("\nMonthly Firm Count Analysis by Sector:")
+    print(f"{'Sector':<30} {'Avg':<8} {'Min':<8} {'Max':<8} {'% < ' + str(MIN_STOCKS_PER_INDUSTRY):<10}")
+    print("-" * 70)
+    
+    for sector_data in sector_analysis:
+        print(f"{sector_data['Sector']:<30} {sector_data['Avg_Firms']:<8} {sector_data['Min_Firms']:<8} {sector_data['Max_Firms']:<8} {sector_data['Pct_Below_Min']:<10}")
+
+    # Firm distribution across sectors
+    print_subsection_header("FIRM DISTRIBUTION ACROSS SECTORS (WHOLE PERIOD)")
+    
+    sector_distribution = sample_universe_filtered[sample_universe_filtered['gic_sector'] != 'Other'].groupby('gic_sector', observed=True)['gvkey'].nunique().sort_values(ascending=False)
+    sector_percentages = (sector_distribution / sector_distribution.sum() * 100)
+    
+    print(f"{'Sector':<30} {'Unique Firms':<15} {'Percentage':<12}")
+    print("-" * 60)
+    
+    for sector, count in sector_distribution.items():
+        pct = sector_percentages.get(sector, 0)
+        print(f"{sector:<30} {count:>7,} firms {pct:>8.1f}%")
+
+    # Average firms per sector timeline
+    print_subsection_header(f"AVERAGE NUMBER OF FIRMS PER SECTOR (THROUGHOUT TIMELINE)")
+    print(f"Timeline: {analysis_start_date.strftime('%Y-%m-%d')} to {analysis_end_date.strftime('%Y-%m-%d')}")
+    
+    sector_monthly_averages = []
+    for sector_name, sector_df in sample_universe_filtered.groupby('gic_sector', observed=True):
+        if sector_name == 'Other':
+            continue
+        
+        monthly_counts = sector_df.groupby('crsp_date')['gvkey'].nunique()
+        avg_firms_timeline = monthly_counts.mean()
+        avg_firms_rounded_down = int(np.floor(avg_firms_timeline))
+        
+        sector_monthly_averages.append({
+            'Sector': sector_name,
+            'Avg_Firms_Timeline': avg_firms_timeline,
+            'Avg_Firms_Rounded_Down': avg_firms_rounded_down
+        })
+    
+    sector_monthly_averages.sort(key=lambda x: x['Avg_Firms_Rounded_Down'], reverse=True)
+    
+    print(f"{'Sector':<30} {'Avg Firms (Exact)':<18} {'Avg Firms (Rounded Down)':<22}")
+    print("-" * 75)
+    
+    total_avg_firms = 0
+    for sector_data in sector_monthly_averages:
+        sector = sector_data['Sector']
+        avg_exact = sector_data['Avg_Firms_Timeline']
+        avg_rounded = sector_data['Avg_Firms_Rounded_Down']
+        total_avg_firms += avg_rounded
+        print(f"{sector:<30} {avg_exact:>12.1f} {avg_rounded:>17,}")
+    
+    print("-" * 75)
+    print(f"{'TOTAL':<30} {'':<18} {total_avg_firms:>17,}")
+
+################################################################################################################
+# BEGINNING VS END OF ANALYSIS PERIOD: FIRM COUNT COMPARISON
+################################################################################################################
+
+print_section_header("BEGINNING VS END OF ANALYSIS PERIOD: FIRM COUNT COMPARISON")
+
+if not sample_universe_filtered.empty:
+    # Get first and last dates in the sample
+    first_date = sample_universe_filtered['crsp_date'].min()
+    last_date = sample_universe_filtered['crsp_date'].max()
+    
+    # Get firms at beginning and end of period
+    firms_at_start = sample_universe_filtered[sample_universe_filtered['crsp_date'] == first_date]
+    firms_at_end = sample_universe_filtered[sample_universe_filtered['crsp_date'] == last_date]
+    
+    # Count total firms
+    num_firms_start = len(firms_at_start)
+    num_firms_end = len(firms_at_end)
+    change_absolute = num_firms_end - num_firms_start
+    change_pct = (change_absolute / num_firms_start * 100) if num_firms_start > 0 else 0
+    
+    print_subsection_header("OVERALL FIRM COUNT EVOLUTION")
+    print_stat_line(f"Number of Firms at Start ({first_date.strftime('%Y-%m-%d')})", f"{num_firms_start:,}")
+    print_stat_line(f"Number of Firms at End ({last_date.strftime('%Y-%m-%d')})", f"{num_firms_end:,}")
+    print_stat_line("Absolute Change", f"{change_absolute:+,}")
+    print_stat_line("Percentage Change", f"{change_pct:+.1f}%")
+    
+    # Sector-level analysis
+    print_subsection_header("SECTOR-LEVEL FIRM COUNT COMPARISON")
+    
+    # Get sector counts for start and end
+    sectors_start = firms_at_start[firms_at_start['gic_sector'] != 'Other'].groupby('gic_sector', observed=True).size()
+    sectors_end = firms_at_end[firms_at_end['gic_sector'] != 'Other'].groupby('gic_sector', observed=True).size()
+    
+    # Combine into a comparison dataframe
+    sector_comparison = pd.DataFrame({
+        'Start': sectors_start,
+        'End': sectors_end
+    }).fillna(0).astype(int)
+    
+    sector_comparison['Change'] = sector_comparison['End'] - sector_comparison['Start']
+    sector_comparison['Change_Pct'] = ((sector_comparison['End'] - sector_comparison['Start']) / 
+                                      sector_comparison['Start'] * 100).round(1)
+    sector_comparison['Change_Pct'] = sector_comparison['Change_Pct'].fillna(0)
+    
+    # Sort by absolute change (descending)
+    sector_comparison = sector_comparison.reindex(
+        sector_comparison['Change'].abs().sort_values(ascending=False).index
+    )
+    
+    print(f"\n{'Sector':<30} {'Start':<8} {'End':<8} {'Change':<10} {'Change %':<12}")
+    print("-" * 75)
+    
+    for sector in sector_comparison.index:
+        start_count = sector_comparison.loc[sector, 'Start']
+        end_count = sector_comparison.loc[sector, 'End']
+        change = sector_comparison.loc[sector, 'Change']
+        change_pct = sector_comparison.loc[sector, 'Change_Pct']
+        
+        change_str = f"{change:+d}" if change != 0 else "0"
+        change_pct_str = f"{change_pct:+.1f}%" if change_pct != 0 else "0.0%"
+        
+        print(f"{sector:<30} {start_count:>5,} {end_count:>5,} {change_str:>8} {change_pct_str:>10}")
+    
+    # Summary row
+    total_start = sector_comparison['Start'].sum()
+    total_end = sector_comparison['End'].sum()
+    total_change = total_end - total_start
+    total_change_pct = (total_change / total_start * 100) if total_start > 0 else 0
+    
+    print("-" * 75)
+    print(f"{'TOTAL (Excl. Other)':<30} {total_start:>5,} {total_end:>5,} {total_change:+8,} {total_change_pct:+8.1f}%")
+    
+    # Time span information
+    time_span_years = (last_date - first_date).days / 365.25
+    print_subsection_header("ANALYSIS PERIOD DETAILS")
+    print_stat_line("Time Span", f"{time_span_years:.1f} years")
+    print_stat_line("Total Months", f"{sample_universe_filtered['crsp_date'].nunique():,}")
+    
+    # Average annual growth rate
+    if num_firms_start > 0 and time_span_years > 0:
+        cagr = ((num_firms_end / num_firms_start) ** (1/time_span_years) - 1) * 100
+        print_stat_line("Compound Annual Growth Rate (CAGR)", f"{cagr:+.2f}%")
+
+else:
+    print_stat_line("Analysis Status", "No data available for comparison")
+
+    ################################################################################################################
+# BEGINNING VS END OF ANALYSIS PERIOD: FIRM COUNT COMPARISON
+################################################################################################################
+
+print_section_header("BEGINNING VS END OF ANALYSIS PERIOD: FIRM COUNT COMPARISON")
+
+if not sample_universe_filtered.empty:
+    # Get first and last dates in the sample
+    first_date = sample_universe_filtered['crsp_date'].min()
+    last_date = sample_universe_filtered['crsp_date'].max()
+    
+    # Get firms at beginning and end of period
+    firms_at_start = sample_universe_filtered[sample_universe_filtered['crsp_date'] == first_date]
+    firms_at_end = sample_universe_filtered[sample_universe_filtered['crsp_date'] == last_date]
+    
+    # Count total firms
+    num_firms_start = len(firms_at_start)
+    num_firms_end = len(firms_at_end)
+    change_absolute = num_firms_end - num_firms_start
+    change_pct = (change_absolute / num_firms_start * 100) if num_firms_start > 0 else 0
+    
+    print_subsection_header("OVERALL FIRM COUNT EVOLUTION")
+    print_stat_line(f"Number of Firms at Start ({first_date.strftime('%Y-%m-%d')})", f"{num_firms_start:,}")
+    print_stat_line(f"Number of Firms at End ({last_date.strftime('%Y-%m-%d')})", f"{num_firms_end:,}")
+    print_stat_line("Absolute Change", f"{change_absolute:+,}")
+    print_stat_line("Percentage Change", f"{change_pct:+.1f}%")
+    
+    # Sector-level analysis
+    print_subsection_header("SECTOR-LEVEL FIRM COUNT COMPARISON")
+    
+    # Get sector counts for start and end
+    sectors_start = firms_at_start[firms_at_start['gic_sector'] != 'Other'].groupby('gic_sector', observed=True).size()
+    sectors_end = firms_at_end[firms_at_end['gic_sector'] != 'Other'].groupby('gic_sector', observed=True).size()
+    
+    # Combine into a comparison dataframe
+    sector_comparison = pd.DataFrame({
+        'Start': sectors_start,
+        'End': sectors_end
+    }).fillna(0).astype(int)
+    
+    sector_comparison['Change'] = sector_comparison['End'] - sector_comparison['Start']
+    sector_comparison['Change_Pct'] = ((sector_comparison['End'] - sector_comparison['Start']) / 
+                                      sector_comparison['Start'] * 100).round(1)
+    sector_comparison['Change_Pct'] = sector_comparison['Change_Pct'].fillna(0)
+    
+    # Sort by absolute change (descending)
+    sector_comparison = sector_comparison.reindex(
+        sector_comparison['Change'].abs().sort_values(ascending=False).index
+    )
+    
+    print(f"\n{'Sector':<30} {'Start':<8} {'End':<8} {'Change':<10} {'Change %':<12}")
+    print("-" * 75)
+    
+    for sector in sector_comparison.index:
+        start_count = sector_comparison.loc[sector, 'Start']
+        end_count = sector_comparison.loc[sector, 'End']
+        change = sector_comparison.loc[sector, 'Change']
+        change_pct = sector_comparison.loc[sector, 'Change_Pct']
+        
+        change_str = f"{change:+d}" if change != 0 else "0"
+        change_pct_str = f"{change_pct:+.1f}%" if change_pct != 0 else "0.0%"
+        
+        print(f"{sector:<30} {start_count:>5,} {end_count:>5,} {change_str:>8} {change_pct_str:>10}")
+    
+    # Summary row
+    total_start = sector_comparison['Start'].sum()
+    total_end = sector_comparison['End'].sum()
+    total_change = total_end - total_start
+    total_change_pct = (total_change / total_start * 100) if total_start > 0 else 0
+    
+    print("-" * 75)
+    print(f"{'TOTAL (Excl. Other)':<30} {total_start:>5,} {total_end:>5,} {total_change:+8,} {total_change_pct:+8.1f}%")
+    
+    # Time span information
+    time_span_years = (last_date - first_date).days / 365.25
+    print_subsection_header("ANALYSIS PERIOD DETAILS")
+    print_stat_line("Time Span", f"{time_span_years:.1f} years")
+    print_stat_line("Total Months", f"{sample_universe_filtered['crsp_date'].nunique():,}")
+    
+    # Average annual growth rate
+    if num_firms_start > 0 and time_span_years > 0:
+        cagr = ((num_firms_end / num_firms_start) ** (1/time_span_years) - 1) * 100
+        print_stat_line("Compound Annual Growth Rate (CAGR)", f"{cagr:+.2f}%")
+
+else:
+    print_stat_line("Analysis Status", "No data available for comparison")
+
+    ####################################################################################
+######################## SAVE OUTPUT AND PRINT SUMMARY #############################
+####################################################################################
+
+# Save large-cap filtered dataset
+output_path = "/Users/  XXX  /"
+sample_universe.to_csv(output_path, index=False)
+
+print(f"\nFiltered universe dataset saved to: {output_path}")
+print(f"Number of rows in saved file: {len(sample_universe)}")
+
+
+#################### LOAD THE CLEANED LARGE-CAP FILTERED DATASET ###################
+
+file_path = "/Users/  XXX  /"
+sample_universe = pd.read_csv(file_path)
+
+#################### COMPUTING ENERGY DECILE MOMENTUM (6m Rank / 6m Hold) ###################
+# This strategy skips the most recent month (t-1) and uses returns from t-2 to t-7
+
+plt.style.use('seaborn-v0_8-whitegrid')
+
+def compute_decile_momentum(sector_name, industry_dfs):
+    # Extract sector data and prepare returns for momentum calculation
+    sector_df = industry_dfs[sector_name].copy()
+    momentum_df = sector_df[['gvkey', 'crsp_date', 'trt1m']].copy()
+    momentum_df['crsp_date'] = pd.to_datetime(momentum_df['crsp_date'])
+    momentum_df = momentum_df.sort_values(['gvkey', 'crsp_date']).reset_index(drop=True)
+    
+    # Convert returns to decimal format if they're in percentage
+    if momentum_df['trt1m'].max() > 10:
+        momentum_df['trt1m'] = momentum_df['trt1m'] / 100
+    
+    # Calculate 6-month momentum signal SKIPPING the most recent month (t-1)
+    # Uses returns from t-2, t-3, t-4, t-5, t-6, t-7 (standard academic approach)
+    momentum_df['momentum_signal'] = 1.0
+    for lag in range(2, 8): 
+        momentum_df[f'ret_lag_{lag}'] = momentum_df.groupby('gvkey', observed=True)['trt1m'].shift(lag)
+        momentum_df['momentum_signal'] *= (1 + momentum_df[f'ret_lag_{lag}'].fillna(0))
+    momentum_df['momentum_signal'] -= 1
+    momentum_df = momentum_df.drop(columns=[col for col in momentum_df.columns if 'ret_lag_' in col])
+    
+    # Create monthly decile rankings based on momentum signal
+    formation_data = momentum_df.dropna(subset=['momentum_signal']).copy()
+    formation_data['decile'] = formation_data.groupby('crsp_date', observed=True)['momentum_signal'].transform(
+        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') + 1
+    )
+    
+    # Build overlapping 6-month holding period portfolios
+    portfolio_holdings = {}
+    unique_dates = sorted(formation_data['crsp_date'].unique())
+    
+    for formation_date in unique_dates:
+        portfolio = formation_data[formation_data['crsp_date'] == formation_date][['gvkey', 'decile']].copy()
+        holding_dates = [d for d in unique_dates if d > formation_date][:6]
+        
+        for hold_date in holding_dates:
+            if hold_date not in portfolio_holdings:
+                portfolio_holdings[hold_date] = []
+            portfolio_holdings[hold_date].append({'formation_date': formation_date, 'stocks': portfolio})
+    
+    # Calculate monthly returns for long-short strategy (Decile 10 - Decile 1)
+    momentum_returns = []
+    calc_start_date = unique_dates[7]  # Changed from 6 to 7 due to additional lag
+    
+    for hold_date in sorted(portfolio_holdings.keys()):
+        if hold_date < calc_start_date:
+            continue
+        
+        current_returns = momentum_df[momentum_df['crsp_date'] == hold_date][['gvkey', 'trt1m']].copy()
+        overlapping_returns = []
+        
+        for portfolio_info in portfolio_holdings[hold_date]:
+            portfolio_returns = pd.merge(current_returns, portfolio_info['stocks'], on='gvkey', how='inner')
+            decile_returns = portfolio_returns.groupby('decile', observed=True)['trt1m'].mean()
+            
+            if 10 in decile_returns.index and 1 in decile_returns.index:
+                long_short_return = decile_returns[10] - decile_returns[1]
+                overlapping_returns.append(long_short_return)
+        
+        if overlapping_returns:
+            momentum_returns.append({
+                'crsp_date': hold_date,
+                'momentum_return': np.mean(overlapping_returns)
+            })
+    
+    # Filter results to analysis period and calculate statistics
+    results_df = pd.DataFrame(momentum_returns)
+    results_df['crsp_date'] = pd.to_datetime(results_df['crsp_date'])
+    reporting_df = results_df[
+        (results_df['crsp_date'] >= ANALYSIS_START_DATE) & 
+        (results_df['crsp_date'] <= ANALYSIS_END_DATE)
+    ].copy()
+    
+    avg_monthly_return = reporting_df['momentum_return'].mean()
+    monthly_std = reporting_df['momentum_return'].std()
+    
+    # Display summary statistics
+    print("\n============================================================")
+    print(f"{sector_name} Sector - Decile Momentum Strategy Returns ({ANALYSIS_START_DATE.year}-{ANALYSIS_END_DATE.year})")
+    print("(6-month momentum signal, skipping most recent month)")
+    print("============================================================")
+    print(f"Average Monthly Return:          {avg_monthly_return:.2%}")
+    print(f"Monthly Standard Deviation:      {monthly_std:.2%}")
+    print("============================================================")
+    
+    return results_df, avg_monthly_return, monthly_std
+
+# Execute momentum strategy for Energy sector
+results, monthly_return, monthly_std = compute_decile_momentum("Energy", industry_dfs)
+
+#################### COMPUTING ENERGY DECILE VALUE STRATEGY (6m Rank / 6m Hold) ###################
+
+def compute_decile_bm_strategy(sector_name, industry_dfs):
+    # Extract sector data and prepare for book-to-market value strategy
+    sector_df = industry_dfs[sector_name].copy()
+    bm_df = sector_df[['gvkey', 'crsp_date', 'trt1m', 'bm']].copy()
+    bm_df['crsp_date'] = pd.to_datetime(bm_df['crsp_date'])
+    bm_df = bm_df.sort_values(['gvkey', 'crsp_date']).reset_index(drop=True)
+    
+    # Convert returns to decimal format if needed
+    if bm_df['trt1m'].max() > 10:
+        bm_df['trt1m'] = bm_df['trt1m'] / 100
+    
+    # Use current B/M ratios (already 6-month lagged from merge process)
+    
+    # Create monthly decile rankings based on current book-to-market ratio
+    formation_data = bm_df.dropna(subset=['bm']).copy()
+    formation_data['decile'] = formation_data.groupby('crsp_date', observed=True)['bm'].transform(
+        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') + 1
+    )
+    
+    # Build overlapping 6-month holding period portfolios
+    portfolio_holdings = {}
+    unique_dates = sorted(formation_data['crsp_date'].unique())
+    
+    for formation_date in unique_dates:
+        portfolio = formation_data[formation_data['crsp_date'] == formation_date][['gvkey', 'decile']].copy()
+        holding_dates = [d for d in unique_dates if d > formation_date][:6]
+        
+        for hold_date in holding_dates:
+            if hold_date not in portfolio_holdings:
+                portfolio_holdings[hold_date] = []
+            portfolio_holdings[hold_date].append({'formation_date': formation_date, 'stocks': portfolio})
+    
+    # Calculate monthly returns for value strategy (High B/M - Low B/M = Decile 10 - Decile 1)
+    bm_returns = []
+    calc_start_date = unique_dates[6] if len(unique_dates) > 6 else unique_dates[0]  # Changed back to 6 since no additional lag
+    
+    for hold_date in sorted(portfolio_holdings.keys()):
+        if hold_date < calc_start_date:
+            continue
+        
+        current_returns = bm_df[bm_df['crsp_date'] == hold_date][['gvkey', 'trt1m']].copy()
+        overlapping_returns = []
+        
+        for portfolio_info in portfolio_holdings[hold_date]:
+            portfolio_returns = pd.merge(current_returns, portfolio_info['stocks'], on='gvkey', how='inner')
+            decile_returns = portfolio_returns.groupby('decile', observed=True)['trt1m'].mean()
+            
+            if 10 in decile_returns.index and 1 in decile_returns.index:
+                long_short_return = decile_returns[10] - decile_returns[1]
+                overlapping_returns.append(long_short_return)
+        
+        if overlapping_returns:
+            bm_returns.append({
+                'crsp_date': hold_date,
+                'bm_return': np.mean(overlapping_returns)
+            })
+    
+    # Filter results to analysis period and calculate statistics
+    results_df = pd.DataFrame(bm_returns)
+    results_df['crsp_date'] = pd.to_datetime(results_df['crsp_date'])
+    reporting_df = results_df[
+        (results_df['crsp_date'] >= ANALYSIS_START_DATE) & 
+        (results_df['crsp_date'] <= ANALYSIS_END_DATE)
+    ].copy()
+    
+    avg_monthly_return = reporting_df['bm_return'].mean()
+    monthly_std = reporting_df['bm_return'].std()
+
+    
+    # Display summary statistics
+    print("\n============================================================")
+    print(f"{sector_name} Sector - Decile B/M Value Strategy Returns ({ANALYSIS_START_DATE.year}-{ANALYSIS_END_DATE.year})")
+    print("Using 6-month lagged B/M ratios with current market values")
+    print("============================================================")
+    print(f"Average Monthly Return:          {avg_monthly_return:.2%}")
+    print(f"Monthly Standard Deviation:      {monthly_std:.2%}")
+    print("============================================================")
+    
+    return results_df, avg_monthly_return, monthly_std
+
+# Execute value strategy for Energy sector
+results, monthly_return, monthly_std = compute_decile_bm_strategy("Energy", industry_dfs)
+
+#################### ENERGY MOMENTUM & VALUE STRATEGY COMPARISON ###################
+
+# Function to compute value strategy returns without plotting (for comparison purposes)
+def compute_value_returns_only(sector_name, industry_dfs):
+    sector_df = industry_dfs[sector_name].copy()
+    bm_df = sector_df[['gvkey', 'crsp_date', 'trt1m', 'bm']].copy()
+    bm_df['crsp_date'] = pd.to_datetime(bm_df['crsp_date'])
+    bm_df = bm_df.sort_values(['gvkey', 'crsp_date']).reset_index(drop=True)
+    
+    if bm_df['trt1m'].max() > 10:
+        bm_df['trt1m'] = bm_df['trt1m'] / 100
+    
+    # Use current B/M ratios (already 6-month lagged from merge process)
+    
+    # Create decile rankings based on current book-to-market ratio
+    formation_data = bm_df.dropna(subset=['bm']).copy()
+    formation_data['decile'] = formation_data.groupby('crsp_date', observed=True)['bm'].transform(
+        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') + 1
+    )
+    
+    # Build portfolio holdings with 6-month holding periods
+    portfolio_holdings = {}
+    unique_dates = sorted(formation_data['crsp_date'].unique())
+    
+    for formation_date in unique_dates:
+        portfolio = formation_data[formation_data['crsp_date'] == formation_date][['gvkey', 'decile']].copy()
+        holding_dates = [d for d in unique_dates if d > formation_date][:6]
+        for hold_date in holding_dates:
+            if hold_date not in portfolio_holdings:
+                portfolio_holdings[hold_date] = []
+            portfolio_holdings[hold_date].append({'formation_date': formation_date, 'stocks': portfolio})
+    
+    # Calculate long-short returns (High B/M - Low B/M)
+    bm_returns = []
+    calc_start_date = unique_dates[6] if len(unique_dates) > 6 else unique_dates[0]  # Changed back to 6 since no additional lag
+    
+    for hold_date in sorted(portfolio_holdings.keys()):
+        if hold_date < calc_start_date:
+            continue
+        current_returns = bm_df[bm_df['crsp_date'] == hold_date][['gvkey', 'trt1m']].copy()
+        overlapping_returns = []
+        for portfolio_info in portfolio_holdings[hold_date]:
+            portfolio_returns = pd.merge(current_returns, portfolio_info['stocks'], on='gvkey', how='inner')
+            decile_returns = portfolio_returns.groupby('decile', observed=True)['trt1m'].mean()
+            if 10 in decile_returns.index and 1 in decile_returns.index:
+                long_short_return = decile_returns[10] - decile_returns[1]
+                overlapping_returns.append(long_short_return)
+        if overlapping_returns:
+            bm_returns.append({'crsp_date': hold_date, 'r_value': np.mean(overlapping_returns)})
+    
+    return pd.DataFrame(bm_returns)
+
+# Function to compute momentum strategy returns without plotting (for comparison purposes)
+def compute_momentum_returns_only(sector_name, industry_dfs):
+    sector_df = industry_dfs[sector_name].copy()
+    momentum_df = sector_df[['gvkey', 'crsp_date', 'trt1m']].copy()
+    momentum_df['crsp_date'] = pd.to_datetime(momentum_df['crsp_date'])
+    momentum_df = momentum_df.sort_values(['gvkey', 'crsp_date']).reset_index(drop=True)
+    
+    if momentum_df['trt1m'].max() > 10:
+        momentum_df['trt1m'] = momentum_df['trt1m'] / 100
+    
+    # Calculate 6-month momentum signal SKIPPING the most recent month
+    # Uses returns from t-2, t-3, t-4, t-5, t-6, t-7 (academic standard approach)
+    momentum_df['momentum_signal'] = 1.0
+    for lag in range(2, 8): 
+        momentum_df[f'ret_lag_{lag}'] = momentum_df.groupby('gvkey', observed=True)['trt1m'].shift(lag)
+        momentum_df['momentum_signal'] *= (1 + momentum_df[f'ret_lag_{lag}'].fillna(0))
+    momentum_df['momentum_signal'] -= 1
+    momentum_df = momentum_df.drop(columns=[col for col in momentum_df.columns if 'ret_lag_' in col])
+    
+    # Create decile rankings based on momentum signal
+    formation_data = momentum_df.dropna(subset=['momentum_signal']).copy()
+    formation_data['decile'] = formation_data.groupby('crsp_date', observed=True)['momentum_signal'].transform(
+        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') + 1
+    )
+    
+    # Build portfolio holdings with 6-month holding periods
+    portfolio_holdings = {}
+    unique_dates = sorted(formation_data['crsp_date'].unique())
+    
+    for formation_date in unique_dates:
+        portfolio = formation_data[formation_data['crsp_date'] == formation_date][['gvkey', 'decile']].copy()
+        holding_dates = [d for d in unique_dates if d > formation_date][:6]
+        for hold_date in holding_dates:
+            if hold_date not in portfolio_holdings:
+                portfolio_holdings[hold_date] = []
+            portfolio_holdings[hold_date].append({'formation_date': formation_date, 'stocks': portfolio})
+    
+    # Calculate long-short returns (Winners - Losers)
+    momentum_returns = []
+    calc_start_date = unique_dates[7] if len(unique_dates) > 7 else unique_dates[0]  # Keep 7 for momentum due to additional lags
+    
+    for hold_date in sorted(portfolio_holdings.keys()):
+        if hold_date < calc_start_date:
+            continue
+        current_returns = momentum_df[momentum_df['crsp_date'] == hold_date][['gvkey', 'trt1m']].copy()
+        overlapping_returns = []
+        for portfolio_info in portfolio_holdings[hold_date]:
+            portfolio_returns = pd.merge(current_returns, portfolio_info['stocks'], on='gvkey', how='inner')
+            decile_returns = portfolio_returns.groupby('decile', observed=True)['trt1m'].mean()
+            if 10 in decile_returns.index and 1 in decile_returns.index:
+                long_short_return = decile_returns[10] - decile_returns[1]
+                overlapping_returns.append(long_short_return)
+        if overlapping_returns:
+            momentum_returns.append({'crsp_date': hold_date, 'r_momentum': np.mean(overlapping_returns)})
+    
+    return pd.DataFrame(momentum_returns)
+
+# Compute both strategies and merge results for comparison
+value_df = compute_value_returns_only("Energy", industry_dfs)
+momentum_df = compute_momentum_returns_only("Energy", industry_dfs)
+
+# Merge and filter to analysis period
+combined_returns = pd.merge(value_df, momentum_df, on='crsp_date', how='inner')
+start_date = ANALYSIS_START_DATE
+end_date = ANALYSIS_END_DATE
+combined_returns = combined_returns[
+    (combined_returns['crsp_date'] >= start_date) &
+    (combined_returns['crsp_date'] <= end_date)
+].sort_values('crsp_date')
+
+# Calculate comparative statistics
+correlation = combined_returns['r_value'].corr(combined_returns['r_momentum'])
+avg_value = combined_returns['r_value'].mean()
+avg_momentum = combined_returns['r_momentum'].mean()
+std_value = combined_returns['r_value'].std()
+std_momentum = combined_returns['r_momentum'].std()
+
+# Display comprehensive comparison statistics
+print("\n============================================================")
+print(f"Energy Sector - Decile Strategy Statistics ({start_date.year}-{end_date.year})")
+print("Momentum strategy skips most recent month (t-1) to avoid short-term reversals")
+print("Value strategy uses 6-month lagged B/M ratios with current market values")
+print("============================================================")
+print(f"Value Strategy:")
+print(f"  Average Monthly Return:     {avg_value:.2%}")
+print(f"  Monthly Standard Deviation: {std_value:.2%}")
+print(f"\nMomentum Strategy:")
+print(f"  Average Monthly Return:     {avg_momentum:.2%}")
+print(f"  Monthly Standard Deviation: {std_momentum:.2%}")
+print(f"\nCorrelation (Value vs Momentum): {correlation:.4f}")
+print("============================================================")
+
+print(f"\nSample: Energy Sector Monthly Returns ({start_date.year}–{end_date.year}):")
+display(combined_returns.head(7))
+
+################## 50/50 Dynamic Strategy - Energy Sector (6m/6m, 1981-2022)  ##################
+
+# Get complete strategy results from earlier functions
+energy_value_results, _, _ = compute_decile_bm_strategy("Energy", industry_dfs)
+energy_momentum_results, _, _ = compute_decile_momentum("Energy", industry_dfs)
+
+# Extract and standardize column names for merging
+value_df = energy_value_results[['crsp_date', 'bm_return']].rename(columns={'bm_return': 'r_value'})
+momentum_df = energy_momentum_results[['crsp_date', 'momentum_return']].rename(columns={'momentum_return': 'r_momentum'})
+
+# Merge both strategies on the same dates
+combined_returns = pd.merge(value_df, momentum_df, on='crsp_date', how='inner')
+combined_returns = combined_returns.sort_values('crsp_date').reset_index(drop=True)
+
+# Create 50/50 weighted combination of value and momentum strategies
+combined_returns['r_combined'] = 0.5 * combined_returns['r_value'] + 0.5 * combined_returns['r_momentum']
+
+# Calculate cumulative returns for each strategy
+combined_returns['value_cumulative'] = (1 + combined_returns['r_value']).cumprod() - 1
+combined_returns['momentum_cumulative'] = (1 + combined_returns['r_momentum']).cumprod() - 1
+combined_returns['combined_cumulative'] = (1 + combined_returns['r_combined']).cumprod() - 1
+
+# Create separate charts for Value Strategy (Monthly + Cumulative)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+
+# Value Strategy - Monthly Returns
+ax1.plot(combined_returns['crsp_date'], combined_returns['r_value'], color='blue', linewidth=1)
+ax1.axhline(0, color='red', linestyle='--', alpha=0.7)
+ax1.set_title('Energy Sector - Decile B/M Value Strategy Returns', fontsize=14)
+ax1.set_ylabel('Monthly Return')
+ax1.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+ax1.grid(True, alpha=0.3)
+
+# Value Strategy - Cumulative Returns
+ax2.plot(combined_returns['crsp_date'], combined_returns['value_cumulative'], color='green', linewidth=2)
+ax2.set_title('Cumulative Returns')
+ax2.set_xlabel('Date')
+ax2.set_ylabel('Cumulative Return')
+ax2.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Display Value Strategy Statistics
+value_avg = combined_returns['r_value'].mean()
+value_std = combined_returns['r_value'].std()
+print("=" * 70)
+print(f"Energy Sector - Decile B/M Value Strategy Returns ({ANALYSIS_START_DATE.year}-{ANALYSIS_END_DATE.year})")
+print("Using 6-month lagged B/M ratios with current market values")  
+print("=" * 70)
+print(f"Average Monthly Return:          {value_avg:.2%}")
+print(f"Monthly Standard Deviation:      {value_std:.2%}")
+print("=" * 70)
+
+# Create separate charts for Momentum Strategy (Monthly + Cumulative)
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10))
+
+# Momentum Strategy - Monthly Returns
+ax1.plot(combined_returns['crsp_date'], combined_returns['r_momentum'], color='blue', linewidth=1)
+ax1.axhline(0, color='red', linestyle='--', alpha=0.7)
+ax1.set_title('Energy Sector - Decile Momentum Strategy Returns', fontsize=14)
+ax1.set_ylabel('Monthly Return')
+ax1.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+ax1.grid(True, alpha=0.3)
+
+# Momentum Strategy - Cumulative Returns
+ax2.plot(combined_returns['crsp_date'], combined_returns['momentum_cumulative'], color='green', linewidth=2)
+ax2.set_title('Cumulative Returns')
+ax2.set_xlabel('Date')
+ax2.set_ylabel('Cumulative Return')
+ax2.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# Display Momentum Strategy Statistics
+momentum_avg = combined_returns['r_momentum'].mean()
+momentum_std = combined_returns['r_momentum'].std()
+print("=" * 70)
+print(f"Energy Sector - Decile Momentum Strategy Returns ({ANALYSIS_START_DATE.year}-{ANALYSIS_END_DATE.year})")
+print("(6-month momentum signal, skipping most recent month)")
+print("=" * 70)
+print(f"Average Monthly Return:          {momentum_avg:.2%}")
+print(f"Monthly Standard Deviation:      {momentum_std:.2%}")
+print("=" * 70)
+
+# Create comparison chart showing both strategies superimposed (monthly returns only)
+plt.figure(figsize=(15, 8))
+plt.plot(combined_returns['crsp_date'], combined_returns['r_value'], label='Value Strategy (D10-D1)', color='red', alpha=0.7)
+plt.plot(combined_returns['crsp_date'], combined_returns['r_momentum'], label='Momentum Strategy (D10-D1)', color='blue', alpha=0.7)
+plt.axhline(0, color='black', linestyle='--', alpha=0.3)
+plt.title('Energy Sector - Value vs Momentum Strategy Returns (Decile Portfolios)', fontsize=14)
+plt.xlabel('Date')
+plt.ylabel('Monthly Return')
+plt.legend()
+plt.gca().yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+plt.grid(True, alpha=0.3)
+plt.show()
+
+#################### SIMPLIFIED DECILE MOM(6m) + VAL(6m) STRATEGY ####################
+#################### 50/50 WEIGHTING ####################
+
+# Set strategy parameters: 6-month formation and holding periods
+FORMATION_PERIOD = 6
+HOLDING_PERIOD = 6
+START_DATE = ANALYSIS_START_DATE
+END_DATE = ANALYSIS_END_DATE
+
+def compute_decile_momentum(sector_df):
+    # Prepare momentum data with date conversion and sorting
+    momentum_df = sector_df[['gvkey', 'crsp_date', 'trt1m']].copy()
+    momentum_df['crsp_date'] = pd.to_datetime(momentum_df['crsp_date'])
+    momentum_df = momentum_df.sort_values(['gvkey', 'crsp_date']).reset_index(drop=True)
+    
+    # Convert percentage returns to decimal format if needed
+    if momentum_df['trt1m'].max() > 10:
+        momentum_df['trt1m'] = momentum_df['trt1m'] / 100
+    
+    # Calculate 6-month cumulative momentum signal SKIPPING the most recent month
+    # Uses returns from t-2, t-3, t-4, t-5, t-6, t-7 (academic standard approach)
+    momentum_df['momentum_signal'] = 1.0
+    for lag in range(2, 8):
+        momentum_df[f'ret_lag_{lag}'] = momentum_df.groupby('gvkey', observed=True)['trt1m'].shift(lag)
+        momentum_df['momentum_signal'] *= (1 + momentum_df[f'ret_lag_{lag}'].fillna(0))
+    momentum_df['momentum_signal'] -= 1
+    momentum_df = momentum_df.drop(columns=[col for col in momentum_df.columns if 'ret_lag_' in col])
+    
+    # Rank stocks into momentum deciles each month
+    formation_data = momentum_df.dropna(subset=['momentum_signal']).copy()
+    formation_data['decile'] = formation_data.groupby('crsp_date', observed=True)['momentum_signal'].transform(
+        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') + 1
+    )
+    
+    # Create overlapping portfolio structure for 6-month holding periods
+    portfolio_holdings = {}
+    unique_dates = sorted(formation_data['crsp_date'].unique())
+    
+    for formation_date in unique_dates:
+        portfolio = formation_data[formation_data['crsp_date'] == formation_date][['gvkey', 'decile']].copy()
+        holding_dates = [d for d in unique_dates if d > formation_date][:HOLDING_PERIOD]
+        for hold_date in holding_dates:
+            if hold_date not in portfolio_holdings:
+                portfolio_holdings[hold_date] = []
+            portfolio_holdings[hold_date].append({'formation_date': formation_date, 'stocks': portfolio})
+    
+    # Calculate monthly long-short momentum returns (decile 10 - decile 1)
+    momentum_returns = []
+    calc_start_date = unique_dates[7] if len(unique_dates) > 7 else unique_dates[0]  # Keep 7 for momentum due to range(2,8)
+    
+    for hold_date in sorted(portfolio_holdings.keys()):
+        if hold_date < calc_start_date:
+            continue
+        current_returns = momentum_df[momentum_df['crsp_date'] == hold_date][['gvkey', 'trt1m']].copy()
+        overlapping_returns = []
+        for portfolio_info in portfolio_holdings[hold_date]:
+            portfolio_returns = pd.merge(current_returns, portfolio_info['stocks'], on='gvkey', how='inner')
+            decile_returns = portfolio_returns.groupby('decile', observed=True)['trt1m'].mean()
+            if 10 in decile_returns.index and 1 in decile_returns.index:
+                long_short_return = decile_returns[10] - decile_returns[1]
+                overlapping_returns.append(long_short_return)
+        if overlapping_returns:
+            momentum_returns.append({'crsp_date': hold_date, 'momentum_return': np.mean(overlapping_returns)})
+    
+    # Return formatted momentum results
+    results_df = pd.DataFrame(momentum_returns)
+    results_df['crsp_date'] = pd.to_datetime(results_df['crsp_date'])
+    return results_df.sort_values('crsp_date').reset_index(drop=True)
+
+def compute_decile_value(sector_df):
+    # Prepare value data with book-to-market ratios
+    bm_df = sector_df[['gvkey', 'crsp_date', 'trt1m', 'bm']].copy()
+    bm_df['crsp_date'] = pd.to_datetime(bm_df['crsp_date'])
+    bm_df = bm_df.sort_values(['gvkey', 'crsp_date']).reset_index(drop=True)
+    
+    # Convert percentage returns to decimal format if needed
+    if bm_df['trt1m'].max() > 10:
+        bm_df['trt1m'] = bm_df['trt1m'] / 100
+    
+    # Use current B/M ratios (already 6-month lagged from merge process)
+    
+    # Rank stocks into value deciles based on current book-to-market ratio
+    formation_data = bm_df.dropna(subset=['bm']).copy()
+    formation_data['decile'] = formation_data.groupby('crsp_date', observed=True)['bm'].transform(
+        lambda x: pd.qcut(x, q=10, labels=False, duplicates='drop') + 1
+    )
+    
+    # Create overlapping portfolio structure for 6-month holding periods
+    portfolio_holdings = {}
+    unique_dates = sorted(formation_data['crsp_date'].unique())
+    
+    for formation_date in unique_dates:
+        portfolio = formation_data[formation_data['crsp_date'] == formation_date][['gvkey', 'decile']].copy()
+        holding_dates = [d for d in unique_dates if d > formation_date][:HOLDING_PERIOD]
+        for hold_date in holding_dates:
+            if hold_date not in portfolio_holdings:
+                portfolio_holdings[hold_date] = []
+            portfolio_holdings[hold_date].append({'formation_date': formation_date, 'stocks': portfolio})
+    
+    # Calculate monthly long-short value returns (high B/M - low B/M)
+    value_returns = []
+    calc_start_date = unique_dates[6] if len(unique_dates) > 6 else unique_dates[0]  # Changed back to 6 for value (no additional lags)
+    
+    for hold_date in sorted(portfolio_holdings.keys()):
+        if hold_date < calc_start_date:
+            continue
+        current_returns = bm_df[bm_df['crsp_date'] == hold_date][['gvkey', 'trt1m']].copy()
+        overlapping_returns = []
+        for portfolio_info in portfolio_holdings[hold_date]:
+            portfolio_returns = pd.merge(current_returns, portfolio_info['stocks'], on='gvkey', how='inner')
+            decile_returns = portfolio_returns.groupby('decile', observed=True)['trt1m'].mean()
+            if 10 in decile_returns.index and 1 in decile_returns.index:
+                long_short_return = decile_returns[10] - decile_returns[1]
+                overlapping_returns.append(long_short_return)
+        if overlapping_returns:
+            value_returns.append({'crsp_date': hold_date, 'value_return': np.mean(overlapping_returns)})
+    
+    # Return formatted value results
+    results_df = pd.DataFrame(value_returns)
+    results_df['crsp_date'] = pd.to_datetime(results_df['crsp_date'])
+    return results_df.sort_values('crsp_date').reset_index(drop=True)
+
+def process_sector(sector_name, sector_df):
+    # Process individual sector with error handling
+    try:
+        required_cols = ['gvkey', 'crsp_date', 'trt1m', 'bm']
+        if not all(col in sector_df.columns for col in required_cols):
+            return None
+        
+        # Compute momentum and value strategies separately
+        momentum_results = compute_decile_momentum(sector_df)
+        if momentum_results.empty:
+            return None
+            
+        value_results = compute_decile_value(sector_df)
+        if value_results.empty:
+            return None
+        
+        # Merge value and momentum returns by date
+        combined = pd.merge(
+            value_results[['crsp_date', 'value_return']],
+            momentum_results[['crsp_date', 'momentum_return']],
+            on='crsp_date',
+            how='inner'
+        )
+        
+        if combined.empty:
+            return None
+        
+        # Standardize column names
+        combined = combined.rename(columns={
+            'value_return': 'r_value',
+            'momentum_return': 'r_momentum'
+        })
+        
+        # Create 50/50 weighted combined strategy
+        combined['r_combined'] = 0.5 * combined['r_value'] + 0.5 * combined['r_momentum']
+        
+        # Filter to analysis period dates
+        combined = combined[
+            (combined['crsp_date'] >= START_DATE) & 
+            (combined['crsp_date'] <= END_DATE)
+        ].copy()
+        
+        if combined.empty:
+            return None
+        
+        # Calculate sector performance statistics
+        stats = {
+            'Sector': sector_name,
+            'Avg_Value': combined['r_value'].mean(),
+            'Avg_Momentum': combined['r_momentum'].mean(),
+            'Avg_Combined': combined['r_combined'].mean(),
+            'Correlation': combined['r_value'].corr(combined['r_momentum'])
+        }
+        
+        combined['sector'] = sector_name
+        return {'stats': stats, 'data': combined}
+        
+    except:
+        return None
+
+# Display strategy information and analysis period
+print("DECILE VALUE + MOMENTUM STRATEGY (50/50 WEIGHTING)")
+print("Momentum strategy skips most recent month (t-1) to avoid short-term reversals")
+print("Value strategy uses 6-month lagged B/M ratios with current market values")  
+print("="*70)
+
+# Initialize results storage
+all_results = []
+all_data = []
+
+# Process each sector (excluding 'Other' category)
+for sector_name in sorted(industry_dfs.keys()):
+    if sector_name == 'Other':
+        continue
+    result = process_sector(sector_name, industry_dfs[sector_name])
+    if result is not None:
+        all_results.append(result['stats'])
+        all_data.append(result['data'])
+
+# Generate summary table and visualizations if results exist
+if all_results:
+    # Create summary DataFrame with sector statistics
+    summary_df = pd.DataFrame(all_results).set_index('Sector')
+    
+    # Format display table with percentage formatting
+    display_df = summary_df.copy()
+    for col in ['Avg_Value', 'Avg_Momentum', 'Avg_Combined']:
+        display_df[col] = display_df[col].map('{:.2%}'.format)
+    display_df['Correlation'] = display_df['Correlation'].map('{:.3f}'.format)
+    
+    # Display sector summary table
+    print("\nSUMMARY BY SECTOR:")
+    display(display_df)
+    
+    # Create dual visualization: returns and correlations
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Left plot: Bar chart of average returns by strategy
+    x = np.arange(len(summary_df))
+    width = 0.25
+    
+    ax1.bar(x - width, summary_df['Avg_Value'], width, label='Value', alpha=0.8)
+    ax1.bar(x, summary_df['Avg_Momentum'], width, label='Momentum', alpha=0.8)
+    ax1.bar(x + width, summary_df['Avg_Combined'], width, label='Combined (50/50)', alpha=0.8)
+    
+    ax1.set_xlabel('Sector')
+    ax1.set_ylabel('Average Monthly Return')
+    ax1.set_title('Average Returns by Strategy and Sector')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(summary_df.index, rotation=45, ha='right')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.axhline(0, color='black', linewidth=0.8)
+    ax1.yaxis.set_major_formatter(mtick.PercentFormatter(1.0))
+    
+    # Right plot: Horizontal bar chart of value-momentum correlations
+    correlations = summary_df['Correlation'].sort_values()
+    colors = ['red' if x < 0 else 'green' for x in correlations]
+    ax2.barh(correlations.index, correlations.values, color=colors, alpha=0.7)
+    ax2.set_xlabel('Correlation')
+    ax2.set_title('Value-Momentum Correlation by Sector')
+    ax2.grid(True, alpha=0.3)
+    ax2.axvline(0, color='black', linewidth=0.8)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Calculate equal-weighted portfolio across all sectors
+    combined_data = pd.concat(all_data, ignore_index=True)
+    monthly_portfolio = combined_data.groupby('crsp_date')[['r_value', 'r_momentum', 'r_combined']].mean()
+    
+    # Display overall portfolio performance summary
+    print("\n" + "="*70)
+    print("OVERALL PORTFOLIO (Equal-Weighted Across Sectors):")
+    print(f"Average Return (Value):     {monthly_portfolio['r_value'].mean():>8.2%}")
+    print(f"Average Return (Momentum):  {monthly_portfolio['r_momentum'].mean():>8.2%}")
+    print(f"Average Return (Combined):  {monthly_portfolio['r_combined'].mean():>8.2%}")
+    print("="*70)
+    
+    # Report number of successfully processed sectors
+    print(f"\nProcessed {len(all_results)} sectors successfully")
+
+    ################################################################################
+# Combine All Sector Monthly Data into Results DataFrame
+################################################################################
+
+# Combine all individual sector results into single comprehensive dataset
+full_results_df = pd.concat(all_data, ignore_index=True)
+
+# Rename columns to match standard naming convention
+full_results_df = full_results_df.rename(columns={
+    'sector': 'industry',
+    'r_combined': 'r_val_mom'
+})
+
+# Add weighting parameter for reference (50/50 weighting)
+full_results_df['rho_t'] = 0.5
+
+# Display summary statistics of combined dataset
+print(f"\nSuccessfully created 'full_results_df' by combining monthly results for {full_results_df['industry'].nunique()} sectors.")
+print(f"Total monthly observations in full_results_df: {len(full_results_df)}")
+print("Columns in full_results_df:", full_results_df.columns.tolist())
+
+print("\nSample of full_results_df:")
+display(full_results_df.head())
+
+########### SECTOR SUMMARY ##############
+
+filtered_df = full_results_df[full_results_df['industry'] != 'Other']
+
+sector_summary = (
+    filtered_df
+    .groupby('industry')
+    .agg({
+        'r_value': ['mean', 'std'],
+        'r_momentum': ['mean', 'std'],
+        'r_val_mom': ['mean', 'std'],
+        'rho_t': 'mean'
+    })
+)
+
+sector_summary.columns = [
+    'Avg Value Return', 'Std Value',
+    'Avg Momentum Return', 'Std Momentum',
+    'Avg Combined Return', 'Std Combined',
+    'Avg Rho (Weight on Value)'
+]
+
+correlations = (
+    filtered_df
+    .groupby('industry')[['r_value', 'r_momentum']]
+    .apply(lambda x: x.corr().iloc[0, 1])
+    .rename('Corr(Value, Momentum)')
+)
+
+summary_df = sector_summary.reset_index().merge(correlations, on='industry')
+
+summary_df = summary_df[[
+    'industry',
+    'Avg Momentum Return',
+    'Avg Value Return',
+    'Avg Combined Return',
+    'Std Momentum',
+    'Std Value',
+    'Std Combined',
+    'Avg Rho (Weight on Value)',
+    'Corr(Value, Momentum)'
+]]
+
+summary_df = summary_df.sort_values(by='Avg Combined Return', ascending=False)
+
+pd.set_option("display.float_format", "{:.4f}".format)
+print("\n=== Sector Summary: Value, Momentum, Combined Strategies (Excl. 'Other') ===")
+display(summary_df)
+
+########### SECTOR SUMMARY WITH CUSTOM COLORMAPS - PERCENTAGE FORMAT ##############
+
+# Import colormap functionality for enhanced visualization
+from matplotlib.colors import LinearSegmentedColormap
+
+# Filter dataset excluding 'Other' category
+filtered_df = full_results_df[full_results_df['industry'] != 'Other']
+
+# Calculate comprehensive sector statistics
+sector_summary = (
+    filtered_df
+    .groupby('industry')
+    .agg({
+        'r_value': ['mean', 'std'],
+        'r_momentum': ['mean', 'std'],
+        'r_val_mom': ['mean', 'std'],
+        'rho_t': 'mean'
+    })
+)
+
+# Standardize column names
+sector_summary.columns = [
+    'Avg Value Return', 'Std Value',
+    'Avg Momentum Return', 'Std Momentum',
+    'Avg Combined Return', 'Std Combined',
+    'Avg Rho (Weight on Value)'
+]
+
+# Calculate value-momentum correlations by sector
+correlations = (
+    filtered_df
+    .groupby('industry')[['r_value', 'r_momentum']]
+    .apply(lambda x: x.corr().iloc[0, 1])
+    .rename('Corr(Value, Momentum)')
+)
+
+# Merge all statistics into final summary table
+summary_df = sector_summary.reset_index().merge(correlations, on='industry')
+
+# Organize columns in logical order
+summary_df = summary_df[[
+    'industry',
+    'Avg Momentum Return',
+    'Avg Value Return',
+    'Avg Combined Return',
+    'Std Momentum',
+    'Std Value',
+    'Std Combined',
+    'Avg Rho (Weight on Value)',
+    'Corr(Value, Momentum)'
+]]
+
+# Sort sectors by combined strategy performance
+summary_df = summary_df.sort_values(by='Avg Combined Return', ascending=False)
+
+# Define custom color schemes for different metric types
+# Returns colormap: red (negative) to green (positive)
+ret_colors = ["darkred", "red", "lightcoral", "white", "palegreen", "green", "darkgreen"]
+ret_values = [0, .15, .4, .5, 0.6, .9, 1.]
+ret_color_positions = list(zip(ret_values, ret_colors))
+returns_cmap = LinearSegmentedColormap.from_list('rg', ret_color_positions, N=256)
+
+# Standard deviation colormap: green (low volatility) to white (high volatility)
+std_colors_reversed = ["darkgreen", "green", "lightgreen", "palegreen", "white"]
+std_values = [0, 0.25, 0.5, 0.75, 1.0]
+std_positions_reversed = list(zip(std_values, std_colors_reversed))
+std_cmap_reversed = LinearSegmentedColormap.from_list('std_gw', std_positions_reversed, N=256)
+
+# Correlation colormap: darker red (negative) to white (zero)
+corr_colors_darker = ["firebrick", "indianred", "lightcoral", "white"]
+corr_values = [0, 0.3, 0.6, 1.0]
+corr_positions_darker = list(zip(corr_values, corr_colors_darker))
+corr_cmap_darker = LinearSegmentedColormap.from_list('corr_darker_rw', corr_positions_darker, N=256)
+
+print("\n=== Sector Summary: Value, Momentum, Combined Strategies (Excl. 'Other') ===")
+
+# Define column groups for different color treatments
+combined_return_col = ['Avg Combined Return']
+combined_std_col = ['Std Combined']
+corr_col = ['Corr(Value, Momentum)']
+
+# Calculate scaling parameters for symmetric color ranges
+max_abs_return = max(abs(summary_df['Avg Combined Return'].min()), abs(summary_df['Avg Combined Return'].max()))
+min_corr = summary_df['Corr(Value, Momentum)'].min()
+
+# Set percentage formatting for return and volatility columns
+format_dict = {col: '{:.2%}' for col in summary_df.columns if 'Return' in col or 'Std' in col}
+format_dict['Avg Rho (Weight on Value)'] = '{:.4f}'
+format_dict['Corr(Value, Momentum)'] = '{:.4f}'
+
+# Apply styling with custom colormaps and formatting
+styled_df = summary_df.style\
+    .format(format_dict)\
+    .background_gradient(
+        cmap=returns_cmap,
+        subset=combined_return_col,
+        vmin=-max_abs_return,
+        vmax=max_abs_return
+    )\
+    .background_gradient(
+        cmap=std_cmap_reversed,
+        subset=combined_std_col
+    )\
+    .background_gradient(
+        cmap=corr_cmap_darker,
+        subset=corr_col,
+        vmin=min_corr,
+        vmax=0
+    )\
+    .set_properties(**{'text-align': 'center'})\
+    .set_table_styles([dict(selector="th", props=[('text-align', 'center')])])\
+    .set_caption("Sector Performance Summary (Percentage Format)")
+
+display(styled_df)
+
+########### SECTOR SUMMARY WITH CUSTOM COLORMAPS - ANNUALIZED FORMAT ##############
+
+# Import colormap functionality for enhanced visualization
+from matplotlib.colors import LinearSegmentedColormap
+import numpy as np
+
+# Filter dataset excluding 'Other' category
+filtered_df = full_results_df[full_results_df['industry'] != 'Other']
+
+# Calculate comprehensive sector statistics (monthly)
+sector_summary = (
+    filtered_df
+    .groupby('industry')
+    .agg({
+        'r_value': ['mean', 'std'],
+        'r_momentum': ['mean', 'std'],
+        'r_val_mom': ['mean', 'std'],
+        'rho_t': 'mean'
+    })
+)
+
+# Standardize column names
+sector_summary.columns = [
+    'Avg Value Return', 'Std Value',
+    'Avg Momentum Return', 'Std Momentum',
+    'Avg Combined Return', 'Std Combined',
+    'Avg Rho (Weight on Value)'
+]
+
+# Calculate value-momentum correlations by sector
+correlations = (
+    filtered_df
+    .groupby('industry')[['r_value', 'r_momentum']]
+    .apply(lambda x: x.corr().iloc[0, 1])
+    .rename('Corr(Value, Momentum)')
+)
+
+# Merge all statistics into final summary table
+summary_df = sector_summary.reset_index().merge(correlations, on='industry')
+
+# ============ CONVERT TO ANNUALIZED FIGURES ============
+# Convert returns using geometric annualization: (1 + r_monthly)^12 - 1
+return_cols = ['Avg Value Return', 'Avg Momentum Return', 'Avg Combined Return']
+for col in return_cols:
+    summary_df[col] = (1 + summary_df[col])**12 - 1
+
+# Convert standard deviations using square root scaling: σ_monthly × √12
+std_cols = ['Std Value', 'Std Momentum', 'Std Combined']
+for col in std_cols:
+    summary_df[col] = summary_df[col] * np.sqrt(12)
+
+# Correlations and rho weights remain unchanged (they're dimensionless)
+# =====================================================
+
+# Organize columns in logical order
+summary_df = summary_df[[
+    'industry',
+    'Avg Momentum Return',
+    'Avg Value Return',
+    'Avg Combined Return',
+    'Std Momentum',
+    'Std Value',
+    'Std Combined',
+    'Avg Rho (Weight on Value)',
+    'Corr(Value, Momentum)'
+]]
+
+# Sort sectors by combined strategy performance
+summary_df = summary_df.sort_values(by='Avg Combined Return', ascending=False)
+
+# Define custom color schemes for different metric types
+# Returns colormap: red (negative) to green (positive)
+ret_colors = ["darkred", "red", "lightcoral", "white", "palegreen", "green", "darkgreen"]
+ret_values = [0, .15, .4, .5, 0.6, .9, 1.]
+ret_color_positions = list(zip(ret_values, ret_colors))
+returns_cmap = LinearSegmentedColormap.from_list('rg', ret_color_positions, N=256)
+
+# Standard deviation colormap: green (low volatility) to white (high volatility)
+std_colors_reversed = ["darkgreen", "green", "lightgreen", "palegreen", "white"]
+std_values = [0, 0.25, 0.5, 0.75, 1.0]
+std_positions_reversed = list(zip(std_values, std_colors_reversed))
+std_cmap_reversed = LinearSegmentedColormap.from_list('std_gw', std_positions_reversed, N=256)
+
+# Correlation colormap: darker red (negative) to white (zero)
+corr_colors_darker = ["firebrick", "indianred", "lightcoral", "white"]
+corr_values = [0, 0.3, 0.6, 1.0]
+corr_positions_darker = list(zip(corr_values, corr_colors_darker))
+corr_cmap_darker = LinearSegmentedColormap.from_list('corr_darker_rw', corr_positions_darker, N=256)
+
+print("\n=== Sector Summary: Value, Momentum, Combined Strategies - ANNUALIZED (Excl. 'Other') ===")
+
+# Define column groups for different color treatments
+combined_return_col = ['Avg Combined Return']
+combined_std_col = ['Std Combined']
+corr_col = ['Corr(Value, Momentum)']
+
+# Calculate scaling parameters for symmetric color ranges
+max_abs_return = max(abs(summary_df['Avg Combined Return'].min()), abs(summary_df['Avg Combined Return'].max()))
+min_corr = summary_df['Corr(Value, Momentum)'].min()
+
+# Set percentage formatting for return and volatility columns
+format_dict = {col: '{:.1%}' for col in summary_df.columns if 'Return' in col or 'Std' in col}
+format_dict['Avg Rho (Weight on Value)'] = '{:.4f}'
+format_dict['Corr(Value, Momentum)'] = '{:.4f}'
+
+# Apply styling with custom colormaps and formatting
+styled_df = summary_df.style\
+    .format(format_dict)\
+    .background_gradient(
+        cmap=returns_cmap,
+        subset=combined_return_col,
+        vmin=-max_abs_return,
+        vmax=max_abs_return
+    )\
+    .background_gradient(
+        cmap=std_cmap_reversed,
+        subset=combined_std_col
+    )\
+    .background_gradient(
+        cmap=corr_cmap_darker,
+        subset=corr_col,
+        vmin=min_corr,
+        vmax=0
+    )\
+    .set_properties(**{'text-align': 'center'})\
+    .set_table_styles([dict(selector="th", props=[('text-align', 'center')])])\
+    .set_caption("Sector Performance Summary - ANNUALIZED")
+
+display(styled_df)
+
+# Print conversion note
+print("\nNOTE: Returns converted using geometric annualization: (1 + r_monthly)^12 - 1")
+print("Standard deviations converted using: σ_monthly × √12")
+
+######## Correlation Matrix between Industries for the VALUE + MOMENTUM STRATEGY ###########
+
+# Define custom red-to-green colormap for correlation visualization
+colors = ["darkred", "red", "lightcoral", "white", "palegreen", "green", "darkgreen"]
+values = [0, .15, .4, .5, 0.6, .9, 1.]
+color_positions = list(zip(values, colors))
+custom_cmap = LinearSegmentedColormap.from_list('rg', color_positions, N=256)
+
+# Filter out 'Other' category for clean correlation analysis
+filtered_df = full_results_df[full_results_df['industry'] != 'Other'].copy()
+
+# Create pivot table with sectors as columns and dates as rows
+combined_matrix = filtered_df.pivot(index='crsp_date', columns='industry', values='r_val_mom')
+combined_matrix = combined_matrix.dropna(how='all')
+
+# Calculate correlation matrix between sector strategies
+combined_corr = combined_matrix.corr()
+
+# Create upper triangular mask to show only unique correlations
+mask = np.triu(np.ones_like(combined_corr, dtype=bool))
+
+# Calculate actual correlation range for optimal color scaling
+actual_corr_values = combined_corr.values[~np.eye(combined_corr.shape[0], dtype=bool)]
+actual_min = actual_corr_values.min()
+actual_max = actual_corr_values.max()
+
+print(f"Actual correlation range: {actual_min:.3f} to {actual_max:.3f}")
+
+# Add padding to color scale for better visualization
+padding = 0.02
+vmin = actual_min - padding
+vmax = actual_max + padding
+
+print(f"Color scale range: {vmin:.3f} to {vmax:.3f}")
+
+# Create correlation heatmap with custom styling
+plt.figure(figsize=(12, 10))
+sns.heatmap(
+    combined_corr,
+    mask=mask,
+    annot=True,
+    fmt=".2f",
+    cmap=custom_cmap,
+    linewidths=0.5,
+    square=True,
+    cbar_kws={"shrink": 0.75, "label": "Correlation Coefficient"},
+    annot_kws={"size": 9},
+    vmin=vmin,
+    vmax=vmax,
+    center=0
+)
+
+# Format plot with titles and labels
+plt.title("Correlation Matrix: Combined Strategy (Value + Momentum) Returns\n(Color scaled to actual data range)", fontsize=15, pad=10)
+plt.xticks(rotation=45, ha='right')
+plt.yticks(rotation=0)
+plt.tight_layout()
+plt.show()
+
+# Calculate and display correlation statistics
+print("\n=== Correlation Matrix Statistics ===")
+upper_triangle_corr = combined_corr.values[np.triu_indices_from(combined_corr.values, k=1)]
+
+print(f"Average correlation: {upper_triangle_corr.mean():.3f}")
+print(f"Highest correlation: {upper_triangle_corr.max():.3f}")
+print(f"Lowest correlation: {upper_triangle_corr.min():.3f}")
+print(f"Standard deviation: {upper_triangle_corr.std():.3f}")
+
+# Identify and display highest/lowest correlation pairs
+print(f"\n HIGHEST CORRELATIONS:")
+corr_pairs = []
+for i in range(len(combined_corr.columns)):
+    for j in range(i+1, len(combined_corr.columns)):
+        corr_pairs.append({
+            'Sector1': combined_corr.columns[i],
+            'Sector2': combined_corr.columns[j], 
+            'Correlation': combined_corr.iloc[i,j]
+        })
+
+# Sort correlation pairs and display top/bottom 5
+corr_pairs_df = pd.DataFrame(corr_pairs).sort_values('Correlation', ascending=False)
+
+print("Top 5 most correlated pairs:")
+for i in range(min(5, len(corr_pairs_df))):
+    row = corr_pairs_df.iloc[i]
+    print(f"  {row['Sector1']} ↔ {row['Sector2']}: {row['Correlation']:.3f}")
+
+print(f"\n LOWEST CORRELATIONS:")
+print("Top 5 least correlated pairs:")
+for i in range(max(0, len(corr_pairs_df)-5), len(corr_pairs_df)):
+    row = corr_pairs_df.iloc[i]
+    print(f"  {row['Sector1']} ↔ {row['Sector2']}: {row['Correlation']:.3f}")
+
+    ############# R COMBO EQUAL WEIGHTING SCHEME ##############
+
+def equal_weighted_combo(full_results_df):
+    # Filter out 'Other' category for portfolio construction
+    filtered_df = full_results_df[full_results_df['industry'] != 'Other'].copy()
+    
+    # Calculate equal weight for each industry
+    n_industries = filtered_df['industry'].nunique()
+    equal_weight = 1 / n_industries
+    
+    # Create equal-weighted portfolio returns
+    equal_weighted = (
+        filtered_df
+        .assign(weight=equal_weight)
+        .assign(weighted_return=lambda x: x['weight'] * x['r_val_mom'])
+        .groupby('crsp_date', as_index=False)
+        .agg({'weighted_return': 'sum'})
+        .rename(columns={'weighted_return': 'r_COMBO_EQUAL'})
+    )
+    
+    # Calculate performance statistics for the equal-weighted portfolio
+    returns = equal_weighted['r_COMBO_EQUAL']
+    positive_months = len(returns[returns > 0])
+    negative_months = len(returns[returns < 0])
+    
+    # Compile summary statistics
+    stats = {
+        'Number of Industries': n_industries,
+        'Equal Weight per Industry': equal_weight,
+        'Mean Monthly Return (%)': returns.mean(),
+        'Std Dev (%)': returns.std(),
+        'Min Return (%)': returns.min(),
+        'Max Return (%)': returns.max(),
+    }
+    
+    return {
+        'returns': equal_weighted,
+        'stats': pd.DataFrame.from_dict(stats, orient='index', columns=['Value']),
+        'weights': {industry: equal_weight for industry in filtered_df['industry'].unique()}
+    }
+
+# Execute equal-weighted portfolio analysis
+equal_results = equal_weighted_combo(full_results_df)
+print("\n=== Equal Weighted Combined Portfolio ===")
+print("\nPerformance Statistics:")
+display(equal_results['stats'])
+print("\nLast 5 Period Returns:")
+display(equal_results['returns'].tail())
+
+# Filter out 'Other' category for portfolio analysis
+filtered_df = full_results_df[full_results_df['industry'] != 'Other'].copy()
+
+# Calculate dynamic equal weights based on number of industries per date
+filtered_df['equal_weight'] = 1 / filtered_df.groupby('crsp_date')['industry'].transform('count')
+
+# Compute weighted returns for each observation
+filtered_df['weighted_return_eq'] = filtered_df['equal_weight'] * filtered_df['r_val_mom']
+
+# Aggregate to monthly equal-weighted portfolio returns
+equal_weighted_returns = (
+    filtered_df.groupby('crsp_date', as_index=False)['weighted_return_eq']
+    .sum()
+    .rename(columns={'weighted_return_eq': 'r_combo_equal'})
+)
+
+# Prepare data for time series plotting
+equal_weighted_returns['crsp_date'] = pd.to_datetime(equal_weighted_returns['crsp_date'])
+equal_weighted_returns.set_index('crsp_date', inplace=True)
+
+# Create time series plot of equal-weighted returns
+plt.figure(figsize=(12, 6))
+plt.plot(equal_weighted_returns.index, equal_weighted_returns['r_combo_equal'], label='Equal-Weighted Combo Return', color='darkgreen', linewidth=2)
+
+plt.title('Equal-Weighted Industry Combo Returns Over Time')
+plt.xlabel('Date')
+plt.ylabel('Monthly Return')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+##############################################################################
+# CUMULATIVE LOG RETURNS WITH VOLATILITY SCALING (ASNESS, 2013)
+# SECTOR-LEVEL THEN MARKET-LEVEL AGGREGATION
+##############################################################################
+
+print("Implementing two-step methodology...")
+
+# STEP 1: CREATE SECTOR-LEVEL STRATEGIES
+# Group by date and industry to get sector-level equal-weighted returns
+print("Step 1: Creating sector-level strategies...")
+
+sector_returns = full_results_df.groupby(['crsp_date', 'industry']).agg({
+    'r_value': 'mean',      # Equal-weighted average within each sector
+    'r_momentum': 'mean',   # Equal-weighted average within each sector
+}).reset_index()
+
+# Apply Equation (1): Create combined strategy for each sector k
+# r^COMBO_{k,t} = θ^VALUE_{k,t} × r^VALUE_{k,t} + (1 - θ^VALUE_{k,t}) × r^MOMENTUM_{k,t}
+# Where θ = 0.5 for all sectors k and time periods t
+THETA = 0.5  # Equal weighting between value and momentum within each sector
+
+sector_returns['r_combo'] = (THETA * sector_returns['r_value'] + 
+                            (1 - THETA) * sector_returns['r_momentum'])
+
+print(f"Created combined strategies for {sector_returns['industry'].nunique()} sectors with θ = {THETA}")
+
+# STEP 2: CREATE MARKET-LEVEL STRATEGIES  
+# Apply Equation (2): Equal-weight across sectors
+# r^MARKET_COMBO_t = Σ(k=1 to 11) ω_{t-1,k} × r^COMBO_{k,t}
+# Where ω = 1/11 for all sectors k
+print("Step 2: Aggregating to market level...")
+
+strategy_returns = sector_returns.groupby('crsp_date').agg({
+    'r_value': 'mean',     # ω = 1/11 for each sector  
+    'r_momentum': 'mean',  # ω = 1/11 for each sector
+    'r_combo': 'mean'      # ω = 1/11 for each sector
+}).reset_index()
+
+strategy_returns.set_index('crsp_date', inplace=True)
+
+# Rename columns to match expected format
+strategy_returns = strategy_returns.rename(columns={
+    'r_value': 'r_value_eq',
+    'r_momentum': 'r_momentum_eq', 
+    'r_combo': 'r_combo_eq'
+})
+
+print(f"Market-level aggregation complete with ω = 1/{sector_returns['industry'].nunique()} for each sector")
+
+# STEP 3: APPLY VOLATILITY SCALING (10% annual volatility)
+print("Step 3: Applying volatility scaling...")
+
+TARGET_ANNUAL_VOL = 0.10
+MONTHS_PER_YEAR = 12
+
+# Calculate current annualized volatilities
+current_vol_value = strategy_returns['r_value_eq'].std() * np.sqrt(MONTHS_PER_YEAR)
+current_vol_momentum = strategy_returns['r_momentum_eq'].std() * np.sqrt(MONTHS_PER_YEAR)
+current_vol_combo = strategy_returns['r_combo_eq'].std() * np.sqrt(MONTHS_PER_YEAR)
+
+# Calculate scaling factors
+scale_value = TARGET_ANNUAL_VOL / current_vol_value
+scale_momentum = TARGET_ANNUAL_VOL / current_vol_momentum  
+scale_combo = TARGET_ANNUAL_VOL / current_vol_combo
+
+print(f"Scaling factors: Value={scale_value:.3f}, Momentum={scale_momentum:.3f}, Combined={scale_combo:.3f}")
+
+# Apply volatility scaling
+strategy_returns['r_value_scaled'] = strategy_returns['r_value_eq'] * scale_value
+strategy_returns['r_momentum_scaled'] = strategy_returns['r_momentum_eq'] * scale_momentum
+strategy_returns['r_combo_scaled'] = strategy_returns['r_combo_eq'] * scale_combo
+
+# STEP 4: CALCULATE CUMULATIVE LOG RETURNS
+
+# Calculate log returns on scaled data
+strategy_returns['log_r_value_scaled'] = np.log(1 + strategy_returns['r_value_scaled'])
+strategy_returns['log_r_momentum_scaled'] = np.log(1 + strategy_returns['r_momentum_scaled'])
+strategy_returns['log_r_combo_scaled'] = np.log(1 + strategy_returns['r_combo_scaled'])
+
+# Cumulative log returns 
+strategy_returns['asness_log_cum_value'] = strategy_returns['log_r_value_scaled'].cumsum()
+strategy_returns['asness_log_cum_momentum'] = strategy_returns['log_r_momentum_scaled'].cumsum()
+strategy_returns['asness_log_cum_combo'] = strategy_returns['log_r_combo_scaled'].cumsum()
+
+# STEP 5: CALCULATE ANNUALIZED SHARPE RATIOS
+print("Step 5: Computing performance metrics...")
+
+# Calculate properly annualized Sharpe ratios
+def calc_annualized_sharpe(monthly_returns):
+    monthly_mean = monthly_returns.mean()
+    monthly_std = monthly_returns.std()
+    annual_return = (1 + monthly_mean)**MONTHS_PER_YEAR - 1
+    annual_vol = monthly_std * np.sqrt(MONTHS_PER_YEAR)
+    return annual_return / annual_vol if annual_vol > 0 else np.nan
+
+sharpe_value = calc_annualized_sharpe(strategy_returns['r_value_scaled'])
+sharpe_momentum = calc_annualized_sharpe(strategy_returns['r_momentum_scaled'])
+sharpe_combo = calc_annualized_sharpe(strategy_returns['r_combo_scaled'])
+
+# STEP 6: VISUALIZATION
+print("Step 6: Creating visualization...")
+
+# Set font to Palatino
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Palatino', 'Times New Roman', 'serif']
+
+# Plot chart
+plt.figure(figsize=(14, 8))
+plt.plot(strategy_returns.index, strategy_returns['asness_log_cum_value'], 
+         label=f'Value Strategy (Sharpe Ratio: {sharpe_value:.2f})', color='blue', linewidth=2.5)
+plt.plot(strategy_returns.index, strategy_returns['asness_log_cum_momentum'], 
+         label=f'Momentum Strategy (Sharpe Ratio: {sharpe_momentum:.2f})', color='red', linewidth=2.5)
+plt.plot(strategy_returns.index, strategy_returns['asness_log_cum_combo'], 
+         label=f'Combined Strategy (Sharpe Ratio: {sharpe_combo:.2f})', color='green', linewidth=2.5)
+
+plt.title('Combined Value-Momentum Strategy at the Aggregate Market Level \n (January 1981 to May 2022)', 
+          fontsize=14, fontweight='bold')
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Cumulative Log Return', fontsize=12)
+plt.legend(fontsize=12)
+plt.grid(True, alpha=0.6)
+plt.axhline(0, color='black', linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.show()
+
+# STEP 7: RESULTS SUMMARY
+print("\n" + "="*80)
+print("METHODOLOGY IMPLEMENTATION SUMMARY")
+print("="*80)
+print(f"Step 1: Sector-level strategies created with θ = {THETA}")
+print(f"Step 2: Market-level aggregation with ω = 1/{sector_returns['industry'].nunique()}")
+print(f"Step 3: Volatility scaling to {TARGET_ANNUAL_VOL:.0%} annual volatility")
+print(f"Step 4: Cumulative log returns computed")
+print(f"Step 5: Annualized performance metrics calculated")
+
+print(f"\nValue-Momentum Correlation (scaled): {strategy_returns['r_value_scaled'].corr(strategy_returns['r_momentum_scaled']):.3f}")
+
+print("\nFINAL RESULTS (Annualized, 10% Vol Scaled):")
+print(f"Value Strategy:    Mean = {(1 + strategy_returns['r_value_scaled'].mean())**12 - 1:.1%}, Sharpe Ratio = {sharpe_value:.2f}")
+print(f"Momentum Strategy: Mean = {(1 + strategy_returns['r_momentum_scaled'].mean())**12 - 1:.1%}, Sharpe Ratio = {sharpe_momentum:.2f}")
+print(f"Combined Strategy: Mean = {(1 + strategy_returns['r_combo_scaled'].mean())**12 - 1:.1%}, Sharpe Ratio = {sharpe_combo:.2f}")
+print("="*80)
+
+##############################################################################
+# SECTOR-BY-SECTOR CUMULATIVE PERFORMANCE: VALUE vs MOMENTUM vs COMBO
+# (Proper Sector-Level Aggregated Analysis)
+##############################################################################
+
+# Set plot style and import required libraries
+style.use('seaborn-v0_8-whitegrid')
+
+print("\n--- Calculating Sector-by-Sector Strategy Performance (Aggregated) ---")
+
+# Prepare data
+df_sectors = full_results_df[full_results_df['industry'] != 'Other'].copy()
+df_sectors['crsp_date'] = pd.to_datetime(df_sectors['crsp_date'])
+df_sectors = df_sectors.sort_values(['industry', 'crsp_date']).reset_index(drop=True)
+
+# STEP 1: CREATE SECTOR-LEVEL AGGREGATED RETURNS
+print("Step 1: Aggregating returns at sector level...")
+
+# Group by date and industry to get sector-level equal-weighted returns
+sector_aggregated = df_sectors.groupby(['crsp_date', 'industry']).agg({
+    'r_value': 'mean',      # Equal-weighted average within each sector
+    'r_momentum': 'mean',   # Equal-weighted average within each sector
+}).reset_index()
+
+# Create sector-level combined strategy (θ = 0.5)
+THETA = 0.5
+sector_aggregated['r_val_mom'] = (THETA * sector_aggregated['r_value'] + 
+                                 (1 - THETA) * sector_aggregated['r_momentum'])
+
+# Get list of sectors
+sectors = sorted(sector_aggregated['industry'].unique())
+n_sectors = len(sectors)
+
+# Calculate cumulative returns for each sector
+sector_performance = {}
+
+for sector in sectors:
+    sector_data = sector_aggregated[sector_aggregated['industry'] == sector].copy()
+    sector_data = sector_data.set_index('crsp_date').sort_index()
+    
+    # Calculate cumulative returns for each strategy
+    # Value Strategy
+    sector_data['value_cumulative_factor'] = 1 + sector_data['r_value']
+    sector_data['value_cumulative_return'] = sector_data['value_cumulative_factor'].cumprod() - 1
+    
+    # Momentum Strategy  
+    sector_data['momentum_cumulative_factor'] = 1 + sector_data['r_momentum']
+    sector_data['momentum_cumulative_return'] = sector_data['momentum_cumulative_factor'].cumprod() - 1
+    
+    # Combined Strategy
+    sector_data['combo_cumulative_factor'] = 1 + sector_data['r_val_mom']
+    sector_data['combo_cumulative_return'] = sector_data['combo_cumulative_factor'].cumprod() - 1
+    
+    sector_performance[sector] = sector_data
+
+# Create subplot grid
+cols = int(np.ceil(np.sqrt(n_sectors)))
+rows = int(np.ceil(n_sectors / cols))
+
+fig, axes = plt.subplots(rows, cols, figsize=(20, 16))
+axes = axes.flatten() if n_sectors > 1 else [axes]
+
+# Plot each sector
+for i, sector in enumerate(sectors):
+    ax = axes[i]
+    data = sector_performance[sector]
+    
+    # Plot the three strategies
+    ax.plot(data.index, data['value_cumulative_return'], 
+            label='Value', color='blue', linewidth=2, alpha=0.8)
+    ax.plot(data.index, data['momentum_cumulative_return'], 
+            label='Momentum', color='red', linewidth=2, alpha=0.8)
+    ax.plot(data.index, data['combo_cumulative_return'], 
+            label='Combined (50/50)', color='green', linewidth=2, alpha=0.8)
+    
+    # Formatting
+    ax.set_title(f'{sector}', fontsize=12, fontweight='bold', fontfamily='Palatino')
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.axhline(0, color='black', linestyle='--', linewidth=0.8, alpha=0.7)
+    
+    # Format Y-axis as percentage
+    ax.yaxis.set_major_formatter(mtick.PercentFormatter(xmax=1.0))
+    
+    # Add legend only to first subplot
+    if i == 0:
+        ax.legend(fontsize=10, loc='upper left')
+    
+    # Rotate x-axis labels for readability
+    ax.tick_params(axis='x', rotation=45, labelsize=9)
+    ax.tick_params(axis='y', labelsize=9)
+
+# Hide any unused subplots
+for i in range(n_sectors, len(axes)):
+    axes[i].set_visible(False)
+
+# Overall formatting
+start_date = df_sectors['crsp_date'].min().strftime('%Y-%m')
+end_date = df_sectors['crsp_date'].max().strftime('%Y-%m')
+
+plt.suptitle(f'Sector-by-Sector Cumulative Performance (Equal-Weighted Sector Returns)\n'
+             f'Value vs Momentum vs Combined ({start_date} to {end_date})', 
+             fontsize=16, fontweight='bold', fontfamily='Palatino', y=0.98)
+
+plt.tight_layout()
+plt.subplots_adjust(top=0.93)
+plt.show()
+
+# Comprehensive Statistics Table
+print("\n" + "="*120)
+print("COMPREHENSIVE SECTOR-BY-SECTOR PERFORMANCE ANALYSIS (SECTOR-LEVEL AGGREGATED)")
+print("="*120)
+
+# Calculate comprehensive statistics
+comprehensive_stats = []
+
+for sector in sectors:
+    data = sector_performance[sector]
+    
+    # Basic statistics
+    n_obs = len(data)
+    
+    # Value Strategy Statistics
+    value_mean = data['r_value'].mean()
+    value_std = data['r_value'].std()
+    value_tstat = np.sqrt(n_obs) * value_mean / value_std if value_std > 0 else np.nan
+    value_sharpe = value_mean / value_std if value_std > 0 else np.nan
+    value_final = data['value_cumulative_return'].iloc[-1]
+    
+    # Momentum Strategy Statistics  
+    momentum_mean = data['r_momentum'].mean()
+    momentum_std = data['r_momentum'].std()
+    momentum_tstat = np.sqrt(n_obs) * momentum_mean / momentum_std if momentum_std > 0 else np.nan
+    momentum_sharpe = momentum_mean / momentum_std if momentum_std > 0 else np.nan
+    momentum_final = data['momentum_cumulative_return'].iloc[-1]
+    
+    # Combined Strategy Statistics
+    combo_mean = data['r_val_mom'].mean()
+    combo_std = data['r_val_mom'].std()
+    combo_tstat = np.sqrt(n_obs) * combo_mean / combo_std if combo_std > 0 else np.nan
+    combo_sharpe = combo_mean / combo_std if combo_std > 0 else np.nan
+    combo_final = data['combo_cumulative_return'].iloc[-1]
+    
+    # Correlation between Value and Momentum
+    correlation_val_mom = data['r_value'].corr(data['r_momentum'])
+    
+    comprehensive_stats.append({
+        'Sector': sector,
+        'N_Obs': n_obs,
+        
+        # Value Strategy
+        'Value_Mean': value_mean,
+        'Value_tStat': value_tstat,
+        'Value_StdDev': value_std,
+        'Value_Sharpe': value_sharpe,
+        'Value_Final': value_final,
+        
+        # Momentum Strategy
+        'Momentum_Mean': momentum_mean,
+        'Momentum_tStat': momentum_tstat,
+        'Momentum_StdDev': momentum_std,
+        'Momentum_Sharpe': momentum_sharpe,
+        'Momentum_Final': momentum_final,
+        
+        # Combined Strategy
+        'Combined_Mean': combo_mean,
+        'Combined_tStat': combo_tstat,
+        'Combined_StdDev': combo_std,
+        'Combined_Sharpe': combo_sharpe,
+        'Combined_Final': combo_final,
+        
+        # Correlation
+        'Value_Momentum_Corr': correlation_val_mom
+    })
+
+# Create DataFrame
+stats_df = pd.DataFrame(comprehensive_stats)
+
+# [Rest of the tables and display code remains the same...]
+
+# Table 1: Mean Returns and t-Statistics
+print("\nTABLE 1: MEAN MONTHLY RETURNS AND t-STATISTICS (SECTOR-LEVEL)")
+print("=" * 100)
+table1 = pd.DataFrame({
+    'Sector': stats_df['Sector'],
+    'Value Mean': stats_df['Value_Mean'].map('{:.3%}'.format),
+    'Value t-stat': stats_df['Value_tStat'].map('{:.2f}'.format),
+    'Momentum Mean': stats_df['Momentum_Mean'].map('{:.3%}'.format),
+    'Momentum t-stat': stats_df['Momentum_tStat'].map('{:.2f}'.format),
+    'Combined Mean': stats_df['Combined_Mean'].map('{:.3%}'.format),
+    'Combined t-stat': stats_df['Combined_tStat'].map('{:.2f}'.format)
+})
+display(table1)
+
+print("\nNote: All statistics based on equal-weighted sector-level returns")
+print("Combined strategy uses θ = 0.5 (50% Value + 50% Momentum)")
+print("=" * 120)
+
+##############################################################################
+# SECTOR-BY-SECTOR CUMULATIVE PERFORMANCE - VOLATILITY SCALED PLOTS, NATURAL STATISTICS
+##############################################################################
+
+style.use('seaborn-v0_8-whitegrid')
+
+# Prepare data
+df_sectors = full_results_df[full_results_df['industry'] != 'Other'].copy()
+df_sectors['crsp_date'] = pd.to_datetime(df_sectors['crsp_date'])
+df_sectors = df_sectors.sort_values(['industry', 'crsp_date']).reset_index(drop=True)
+
+# STEP 1: CREATE SECTOR-LEVEL AGGREGATED RETURNS
+sector_aggregated = df_sectors.groupby(['crsp_date', 'industry']).agg({
+    'r_value': 'mean',      # Equal-weighted average within each sector
+    'r_momentum': 'mean',   # Equal-weighted average within each sector
+}).reset_index()
+
+# Create sector-level combined strategy (θ = 0.5)
+THETA = 0.5
+sector_aggregated['r_val_mom'] = (THETA * sector_aggregated['r_value'] + 
+                                 (1 - THETA) * sector_aggregated['r_momentum'])
+
+# Get list of sectors
+sectors = sorted(sector_aggregated['industry'].unique())
+n_sectors = len(sectors)
+
+# Constants for volatility scaling (for plots only)
+TARGET_ANNUAL_VOL = 0.10
+MONTHS_PER_YEAR = 12
+
+# Function to add significance stars based on t-statistic
+def add_significance_stars_tstat(t_stat):
+    """Add significance stars based on t-statistic"""
+    abs_t = abs(t_stat)
+    if abs_t > 2.58:
+        return "***"
+    elif abs_t > 1.96:
+        return "**"
+    elif abs_t > 1.64:
+        return "*"
+    else:
+        return ""
+
+# STEP 2: PREPARE DATA FOR BOTH PLOTS AND STATISTICS
+sector_performance = {}
+sector_stats_data = {}
+
+for sector in sectors:
+    # Work with SECTOR-LEVEL aggregated data
+    sector_data = sector_aggregated[sector_aggregated['industry'] == sector].copy()
+    sector_data = sector_data.set_index('crsp_date').sort_index()
+    
+    # Store UNSCALED data for statistics (natural differences)
+    sector_stats_data[sector] = sector_data.copy()
+    
+    # Calculate volatility scaling factors for PLOTS
+    current_vol_value = sector_data['r_value'].std() * np.sqrt(MONTHS_PER_YEAR)
+    current_vol_momentum = sector_data['r_momentum'].std() * np.sqrt(MONTHS_PER_YEAR)
+    current_vol_combo = sector_data['r_val_mom'].std() * np.sqrt(MONTHS_PER_YEAR)
+    
+    scale_value = TARGET_ANNUAL_VOL / current_vol_value if current_vol_value > 0 else 1
+    scale_momentum = TARGET_ANNUAL_VOL / current_vol_momentum if current_vol_momentum > 0 else 1
+    scale_combo = TARGET_ANNUAL_VOL / current_vol_combo if current_vol_combo > 0 else 1
+    
+    # Apply volatility scaling for PLOTS
+    sector_data['r_value_scaled'] = sector_data['r_value'] * scale_value
+    sector_data['r_momentum_scaled'] = sector_data['r_momentum'] * scale_momentum
+    sector_data['r_combo_scaled'] = sector_data['r_val_mom'] * scale_combo
+    
+    # Calculate cumulative log returns for PLOTS (scaled)
+    sector_data['log_r_value'] = np.log(1 + sector_data['r_value_scaled'])
+    sector_data['log_r_momentum'] = np.log(1 + sector_data['r_momentum_scaled'])
+    sector_data['log_r_combo'] = np.log(1 + sector_data['r_combo_scaled'])
+    
+    sector_data['value_cumulative_log'] = sector_data['log_r_value'].cumsum()
+    sector_data['momentum_cumulative_log'] = sector_data['log_r_momentum'].cumsum()
+    sector_data['combo_cumulative_log'] = sector_data['log_r_combo'].cumsum()
+    
+    sector_performance[sector] = sector_data
+
+# Create subplot grid
+cols = int(np.ceil(np.sqrt(n_sectors)))
+rows = int(np.ceil(n_sectors / cols))
+
+fig, axes = plt.subplots(rows, cols, figsize=(20, 16))
+axes = axes.flatten() if n_sectors > 1 else [axes]
+
+# Plot each sector (using SCALED data for visual comparison)
+for i, sector in enumerate(sectors):
+    ax = axes[i]
+    data = sector_performance[sector]
+    
+    # Plot the three strategies with volatility scaling
+    ax.plot(data.index, data['value_cumulative_log'], 
+            label='Value', color='blue', linewidth=2, alpha=0.8)
+    ax.plot(data.index, data['momentum_cumulative_log'], 
+            label='Momentum', color='red', linewidth=2, alpha=0.8)
+    ax.plot(data.index, data['combo_cumulative_log'], 
+            label='Combined (50/50)', color='green', linewidth=2, alpha=0.8)
+    
+    # Formatting
+    ax.set_title(f'{sector}', fontsize=12, fontweight='bold', fontfamily='Palatino')
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.axhline(0, color='black', linestyle='--', linewidth=0.8, alpha=0.7)
+    
+    # Add legend only to first subplot
+    if i == 0:
+        ax.legend(fontsize=10, loc='upper left')
+    
+    # Rotate x-axis labels for readability
+    ax.tick_params(axis='x', rotation=45, labelsize=9)
+    ax.tick_params(axis='y', labelsize=9)
+
+# Hide any unused subplots
+for i in range(n_sectors, len(axes)):
+    axes[i].set_visible(False)
+
+# Overall formatting
+start_date = df_sectors['crsp_date'].min().strftime('%Y-%m')
+end_date = df_sectors['crsp_date'].max().strftime('%Y-%m')
+
+plt.suptitle(f'Sector-by-Sector Cumulative Log Returns (10% Annual Volatility Scaled for Comparison)\n'
+             f'({start_date} to {end_date})', 
+             fontsize=16, fontweight='bold', fontfamily='Palatino', y=0.98)
+
+plt.tight_layout()
+plt.subplots_adjust(top=0.93)
+plt.show()
+
+# STEP 3: CALCULATE STATISTICS USING UNSCALED DATA (Natural Differences)
+print("\n" + "="*120)
+print("SECTOR-BY-SECTOR PERFORMANCE ANALYSIS - ANNUALIZED (Natural Differences)")
+print("="*120)
+
+comprehensive_stats = []
+
+for sector in sectors:
+    # Use UNSCALED data for statistics (natural sector differences)
+    data = sector_stats_data[sector]
+    n_obs = len(data)
+    
+    # MONTHLY statistics first (unscaled, natural)
+    value_mean_monthly = data['r_value'].mean()
+    value_std_monthly = data['r_value'].std()
+    momentum_mean_monthly = data['r_momentum'].mean()
+    momentum_std_monthly = data['r_momentum'].std()
+    combo_mean_monthly = data['r_val_mom'].mean()
+    combo_std_monthly = data['r_val_mom'].std()
+    
+    # ANNUALIZE using same method as first code
+    value_mean_annual = (1 + value_mean_monthly)**12 - 1
+    value_std_annual = value_std_monthly * np.sqrt(12)
+    momentum_mean_annual = (1 + momentum_mean_monthly)**12 - 1
+    momentum_std_annual = momentum_std_monthly * np.sqrt(12)
+    combo_mean_annual = (1 + combo_mean_monthly)**12 - 1
+    combo_std_annual = combo_std_monthly * np.sqrt(12)
+    
+    # Calculate t-statistics (monthly basis)
+    value_tstat = np.sqrt(n_obs) * value_mean_monthly / value_std_monthly if value_std_monthly > 0 else np.nan
+    momentum_tstat = np.sqrt(n_obs) * momentum_mean_monthly / momentum_std_monthly if momentum_std_monthly > 0 else np.nan
+    combo_tstat = np.sqrt(n_obs) * combo_mean_monthly / combo_std_monthly if combo_std_monthly > 0 else np.nan
+    
+    # Correlation between Value and Momentum (unscaled)
+    correlation_val_mom = data['r_value'].corr(data['r_momentum'])
+    
+    comprehensive_stats.append({
+        'Sector': sector,
+        'Value_Mean': value_mean_annual,
+        'Value_tStat': value_tstat,
+        'Value_StdDev': value_std_annual,
+        'Momentum_Mean': momentum_mean_annual,
+        'Momentum_tStat': momentum_tstat,
+        'Momentum_StdDev': momentum_std_annual,
+        'Combined_Mean': combo_mean_annual,
+        'Combined_tStat': combo_tstat,
+        'Combined_StdDev': combo_std_annual,
+        'Value_Momentum_Corr': correlation_val_mom
+    })
+
+# Create DataFrame
+stats_df = pd.DataFrame(comprehensive_stats)
+
+# Table 1: Annualized Mean Returns and t-Statistics with Significance (NATURAL/UNSCALED)
+print("\nTABLE 1: ANNUALIZED MEAN RETURNS AND t-STATISTICS WITH SIGNIFICANCE (SECTOR-LEVEL - NATURAL)")
+print("=" * 120)
+print("Significance levels: *** p<0.01, ** p<0.05, * p<0.10")
+
+table1 = pd.DataFrame({
+    'Sector': stats_df['Sector'],
+    'Value Mean': stats_df['Value_Mean'].map('{:.1%}'.format),
+    'Value t-stat': stats_df.apply(lambda row: f"{row['Value_tStat']:.2f}{add_significance_stars_tstat(row['Value_tStat'])}", axis=1),
+    'Momentum Mean': stats_df['Momentum_Mean'].map('{:.1%}'.format),
+    'Momentum t-stat': stats_df.apply(lambda row: f"{row['Momentum_tStat']:.2f}{add_significance_stars_tstat(row['Momentum_tStat'])}", axis=1),
+    'Combined Mean': stats_df['Combined_Mean'].map('{:.1%}'.format),
+    'Combined t-stat': stats_df.apply(lambda row: f"{row['Combined_tStat']:.2f}{add_significance_stars_tstat(row['Combined_tStat'])}", axis=1)
+})
+display(table1)
+
+# Table 2: Annualized Standard Deviations (NATURAL/UNSCALED)
+print("\nTABLE 2: ANNUALIZED STANDARD DEVIATIONS (SECTOR-LEVEL - NATURAL)")
+print("=" * 100)
+table2 = pd.DataFrame({
+    'Sector': stats_df['Sector'],
+    'Value StdDev': stats_df['Value_StdDev'].map('{:.1%}'.format),
+    'Momentum StdDev': stats_df['Momentum_StdDev'].map('{:.1%}'.format),
+    'Combined StdDev': stats_df['Combined_StdDev'].map('{:.1%}'.format),
+    'Value-Momentum Corr': stats_df['Value_Momentum_Corr'].map('{:.3f}'.format)
+})
+display(table2)
+
+# Summary of Significant Results
+print("\nSUMMARY OF STATISTICALLY SIGNIFICANT RESULTS:")
+print("=" * 60)
+
+# Count significant results by strategy
+value_significant = stats_df[stats_df['Value_tStat'].abs() > 1.96]['Sector'].tolist()
+momentum_significant = stats_df[stats_df['Momentum_tStat'].abs() > 1.96]['Sector'].tolist()
+combined_significant = stats_df[stats_df['Combined_tStat'].abs() > 1.96]['Sector'].tolist()
+
+print(f"\nValue Strategy (significant at 5% level): {len(value_significant)} sectors")
+if value_significant:
+    print(f"  Sectors: {', '.join(value_significant)}")
+
+print(f"\nMomentum Strategy (significant at 5% level): {len(momentum_significant)} sectors")
+if momentum_significant:
+    print(f"  Sectors: {', '.join(momentum_significant)}")
+
+print(f"\nCombined Strategy (significant at 5% level): {len(combined_significant)} sectors")
+if combined_significant:
+    print(f"  Sectors: {', '.join(combined_significant)}")
+
+print("\nNOTE: ")
+print("PLOTS: Volatility scaled to 10% annually for visual comparison")
+print("STATISTICS: Natural (unscaled) sector differences preserved")
+print("Returns annualized using (1 + r_monthly)^12 - 1")
+print("Standard deviations annualized using σ_monthly × √12")
+print("t-statistics test H₀: mean return = 0")
+print("Significance levels: *** p<0.01, ** p<0.05, * p<0.10")
+print("=" * 120)
+
+############################################################
+############# FACTOR MODEL ANALYSIS (FINAL VERSION) ######
+############################################################
+
+# Use unique variable names to prevent conflicts
+ff_factors_final = pd.read_csv("/Users/  XXX  /")
+ff_factors_final.columns = ff_factors_final.columns.str.lower()
+ff_factors_final.rename(columns={"dateff": "crsp_date"}, inplace=True)
+ff_factors_final["crsp_date"] = pd.to_datetime(ff_factors_final["crsp_date"])
+ff_factors_final.set_index("crsp_date", inplace=True)
+
+# Prepare sector data with unique variable name
+df_sectors_final = full_results_df.copy() 
+df_sectors_final = df_sectors_final[df_sectors_final["industry"] != "Other"]
+df_sectors_final["crsp_date"] = pd.to_datetime(df_sectors_final["crsp_date"])
+
+# Merge data with unique variable name
+df_merged_final = df_sectors_final.merge(
+    ff_factors_final, 
+    left_on="crsp_date", 
+    right_index=True, 
+    how="inner"
+)
+
+print(f"Final merged data shape: {df_merged_final.shape}")
+
+# Function for significance stars
+def add_significance_stars_final(pvalue):
+    if pvalue is None:
+        return ""
+    elif pvalue < 0.01:
+        return "***"
+    elif pvalue < 0.05:
+        return "**"
+    elif pvalue < 0.10:
+        return "*"
+    else:
+        return ""
+
+# Function for geometric annualization
+def geometric_annualize_alpha_final(monthly_alpha):
+    """Convert monthly alpha to annualized using geometric mean"""
+    if monthly_alpha is None:
+        return None
+    return ((1 + monthly_alpha) ** 12 - 1) * 100  # Convert to percentage
+
+# Run factor model regressions with unique variable name
+factor_model_results_final = {}
+
+print("\n" + "="*80)
+print("RUNNING FACTOR MODEL REGRESSIONS")
+print("="*80)
+
+for sector, group in df_merged_final.groupby("industry"):
+    # Clean data for this sector
+    group_clean = group.dropna(subset=['r_val_mom', 'rf', 'mktrf', 'smb', 'hml', 'umd'])
+    
+    if len(group_clean) < 30:  # Need minimum observations
+        print(f"Skipping {sector}: Insufficient data ({len(group_clean)} obs)")
+        continue
+        
+    print(f"{sector}: {len(group_clean)} observations")
+        
+    y = group_clean["r_val_mom"]  # Long-short strategy returns
+
+    # 3-factor model
+    X_3f = sm.add_constant(group_clean[["mktrf", "smb", "hml"]])
+    model_3f = sm.OLS(y, X_3f).fit()
+    
+    # 4-factor model
+    X_4f = sm.add_constant(group_clean[["mktrf", "smb", "hml", "umd"]])
+    model_4f = sm.OLS(y, X_4f).fit()
+
+    factor_model_results_final[sector] = {
+        "3-factor": model_3f,
+        "4-factor": model_4f,
+        "n_obs": len(group_clean)
+    }
+
+# CREATE MONTHLY RESULTS TABLE
+print("\n" + "="*80)
+print("MONTHLY ALPHA RESULTS")
+print("="*80)
+print("Significance levels: *** p<0.01, ** p<0.05, * p<0.10")
+
+monthly_results_table = []
+
+for sector, models in factor_model_results_final.items():
+    m3 = models["3-factor"]
+    m4 = models["4-factor"]
+    n_obs = models["n_obs"]
+    
+    # Extract monthly results (no conversion)
+    alpha_3f = m3.params.get("const")
+    alpha_3f_t = m3.tvalues.get("const")
+    alpha_3f_p = m3.pvalues.get("const")
+    
+    alpha_4f = m4.params.get("const")
+    alpha_4f_t = m4.tvalues.get("const")
+    alpha_4f_p = m4.pvalues.get("const")
+    
+    monthly_results_table.append({
+        "Sector": sector,
+        "Alpha_3F_Monthly": f"{alpha_3f*100:.3f}%{add_significance_stars_final(alpha_3f_p)}" if alpha_3f is not None else "N/A",
+        "t(Alpha_3F)": f"{alpha_3f_t:.2f}" if alpha_3f_t is not None else "N/A",
+        "Alpha_4F_Monthly": f"{alpha_4f*100:.3f}%{add_significance_stars_final(alpha_4f_p)}" if alpha_4f is not None else "N/A",
+        "t(Alpha_4F)": f"{alpha_4f_t:.2f}" if alpha_4f_t is not None else "N/A",
+        "N_Obs": n_obs
+    })
+
+monthly_results_df = pd.DataFrame(monthly_results_table)
+# Sort by 4F alpha
+monthly_results_df['sort_key'] = monthly_results_df['Alpha_4F_Monthly'].apply(lambda x: float(x.split('%')[0]) if x != 'N/A' else -999)
+monthly_results_df = monthly_results_df.sort_values('sort_key', ascending=False).drop('sort_key', axis=1)
+display(monthly_results_df)
+
+# CREATE ANNUALIZED RESULTS TABLE
+print("\n" + "="*80)
+print("ANNUALIZED ALPHA RESULTS (GEOMETRIC CONVERSION)")
+print("="*80)
+print("Conversion: (1 + monthly_alpha)^12 - 1")
+
+annualized_results_table = []
+
+for sector, models in factor_model_results_final.items():
+    m3 = models["3-factor"]
+    m4 = models["4-factor"]
+    n_obs = models["n_obs"]
+    
+    # Extract and convert to annualized
+    alpha_3f = m3.params.get("const")
+    alpha_3f_t = m3.tvalues.get("const")
+    alpha_3f_p = m3.pvalues.get("const")
+    alpha_3f_ann = geometric_annualize_alpha_final(alpha_3f)
+    
+    alpha_4f = m4.params.get("const")
+    alpha_4f_t = m4.tvalues.get("const")
+    alpha_4f_p = m4.pvalues.get("const")
+    alpha_4f_ann = geometric_annualize_alpha_final(alpha_4f)
+    
+    annualized_results_table.append({
+        "Sector": sector,
+        "Alpha_3F_Ann": f"{alpha_3f_ann:.2f}%{add_significance_stars_final(alpha_3f_p)}" if alpha_3f_ann is not None else "N/A",
+        "t(Alpha_3F)": f"{alpha_3f_t:.2f}" if alpha_3f_t is not None else "N/A",
+        "Alpha_4F_Ann": f"{alpha_4f_ann:.2f}%{add_significance_stars_final(alpha_4f_p)}" if alpha_4f_ann is not None else "N/A",
+        "t(Alpha_4F)": f"{alpha_4f_t:.2f}" if alpha_4f_t is not None else "N/A",
+        "N_Obs": n_obs
+    })
+
+annualized_results_df = pd.DataFrame(annualized_results_table)
+# Sort by 4F alpha
+annualized_results_df['sort_key'] = annualized_results_df['Alpha_4F_Ann'].apply(lambda x: float(x.split('%')[0]) if x != 'N/A' else -999)
+annualized_results_df = annualized_results_df.sort_values('sort_key', ascending=False).drop('sort_key', axis=1)
+display(annualized_results_df)
+
+# CREATE COMPREHENSIVE FACTOR LOADINGS TABLE
+print("\n" + "="*100)
+print("COMPREHENSIVE 3-FACTOR AND 4-FACTOR RESULTS")
+print("="*100)
+print("Factor loadings shown in monthly terms (standard practice)")
+print("Significance levels: *** p<0.01, ** p<0.05, * p<0.10")
+
+comprehensive_table = []
+
+for sector, models in factor_model_results_final.items():
+    m3 = models["3-factor"]
+    m4 = models["4-factor"]
+    n_obs = models["n_obs"]
+    
+    # 3F results
+    alpha_3f_ann = geometric_annualize_alpha_final(m3.params.get("const"))
+    alpha_3f_t = m3.tvalues.get("const")
+    alpha_3f_p = m3.pvalues.get("const")
+    
+    mktrf_3f = m3.params.get("mktrf")
+    mktrf_3f_t = m3.tvalues.get("mktrf")
+    mktrf_3f_p = m3.pvalues.get("mktrf")
+    
+    smb_3f = m3.params.get("smb")
+    smb_3f_t = m3.tvalues.get("smb")
+    smb_3f_p = m3.pvalues.get("smb")
+    
+    hml_3f = m3.params.get("hml")
+    hml_3f_t = m3.tvalues.get("hml")
+    hml_3f_p = m3.pvalues.get("hml")
+    
+    rsq_3f = m3.rsquared
+    
+    # 4F results
+    alpha_4f_ann = geometric_annualize_alpha_final(m4.params.get("const"))
+    alpha_4f_t = m4.tvalues.get("const")
+    alpha_4f_p = m4.pvalues.get("const")
+    
+    mktrf_4f = m4.params.get("mktrf")
+    mktrf_4f_t = m4.tvalues.get("mktrf")
+    mktrf_4f_p = m4.pvalues.get("mktrf")
+    
+    smb_4f = m4.params.get("smb")
+    smb_4f_t = m4.tvalues.get("smb")
+    smb_4f_p = m4.pvalues.get("smb")
+    
+    hml_4f = m4.params.get("hml")
+    hml_4f_t = m4.tvalues.get("hml")
+    hml_4f_p = m4.pvalues.get("hml")
+    
+    umd_4f = m4.params.get("umd")
+    umd_4f_t = m4.tvalues.get("umd")
+    umd_4f_p = m4.pvalues.get("umd")
+    
+    rsq_4f = m4.rsquared
+    
+    comprehensive_table.append({
+        "Sector": sector,
+        "N_Obs": n_obs,
+        
+        # 3-Factor
+        "Alpha_3F": f"{alpha_3f_ann:.2f}%{add_significance_stars_final(alpha_3f_p)}" if alpha_3f_ann is not None else "N/A",
+        "t(α_3F)": f"{alpha_3f_t:.2f}" if alpha_3f_t is not None else "N/A",
+        "MktRf_3F": f"{mktrf_3f:.4f}{add_significance_stars_final(mktrf_3f_p)}" if mktrf_3f is not None else "N/A",
+        "t(Mkt_3F)": f"{mktrf_3f_t:.2f}" if mktrf_3f_t is not None else "N/A",
+        "SMB_3F": f"{smb_3f:.4f}{add_significance_stars_final(smb_3f_p)}" if smb_3f is not None else "N/A",
+        "t(SMB_3F)": f"{smb_3f_t:.2f}" if smb_3f_t is not None else "N/A",
+        "HML_3F": f"{hml_3f:.4f}{add_significance_stars_final(hml_3f_p)}" if hml_3f is not None else "N/A",
+        "t(HML_3F)": f"{hml_3f_t:.2f}" if hml_3f_t is not None else "N/A",
+        "R²_3F": f"{rsq_3f:.4f}" if rsq_3f is not None else "N/A",
+        
+        # 4-Factor
+        "Alpha_4F": f"{alpha_4f_ann:.2f}%{add_significance_stars_final(alpha_4f_p)}" if alpha_4f_ann is not None else "N/A",
+        "t(α_4F)": f"{alpha_4f_t:.2f}" if alpha_4f_t is not None else "N/A",
+        "MktRf_4F": f"{mktrf_4f:.4f}{add_significance_stars_final(mktrf_4f_p)}" if mktrf_4f is not None else "N/A",
+        "t(Mkt_4F)": f"{mktrf_4f_t:.2f}" if mktrf_4f_t is not None else "N/A",
+        "SMB_4F": f"{smb_4f:.4f}{add_significance_stars_final(smb_4f_p)}" if smb_4f is not None else "N/A",
+        "t(SMB_4F)": f"{smb_4f_t:.2f}" if smb_4f_t is not None else "N/A",
+        "HML_4F": f"{hml_4f:.4f}{add_significance_stars_final(hml_4f_p)}" if hml_4f is not None else "N/A",
+        "t(HML_4F)": f"{hml_4f_t:.2f}" if hml_4f_t is not None else "N/A",
+        "UMD_4F": f"{umd_4f:.4f}{add_significance_stars_final(umd_4f_p)}" if umd_4f is not None else "N/A",
+        "t(UMD_4F)": f"{umd_4f_t:.2f}" if umd_4f_t is not None else "N/A",
+        "R²_4F": f"{rsq_4f:.4f}" if rsq_4f is not None else "N/A"
+    })
+
+comprehensive_df = pd.DataFrame(comprehensive_table)
+# Sort by 4F alpha
+comprehensive_df['sort_key'] = comprehensive_df['Alpha_4F'].apply(lambda x: float(x.split('%')[0]) if x != 'N/A' else -999)
+comprehensive_df = comprehensive_df.sort_values('sort_key', ascending=False).drop('sort_key', axis=1)
+display(comprehensive_df)
+
+print("\n" + "="*100)
+print("SUMMARY:")
+print(f"- Total sectors analyzed: {len(factor_model_results_final)}")
+print(f"- Sample period: {df_merged_final['crsp_date'].min().strftime('%Y-%m')} to {df_merged_final['crsp_date'].max().strftime('%Y-%m')}")
+print("- Alphas annualized using geometric mean: (1 + monthly_alpha)^12 - 1")
+print("- Factor loadings in monthly terms (academic standard)")
+print("- Long-short strategy returns regressed on Fama-French factors")
+print("="*100)
+print("="*100)
+print("="*100)
+
+print("USE THESE RESULTS - FINAL")
+
+###########################################################################
+########## Comprehensive 1, 3 and 4 Factor Analysis ####################
+###########################################################################
+
+# Load Fama-French monthly factor data
+ff_factors = pd.read_csv("/Users/  XXX  /")
+ff_factors.columns = ff_factors.columns.str.lower()
+
+# Rename date column and convert to datetime
+ff_factors.rename(columns={"dateff": "crsp_date"}, inplace=True)
+ff_factors["crsp_date"] = pd.to_datetime(ff_factors["crsp_date"])
+
+# Set datetime index
+ff_factors.set_index("crsp_date", inplace=True)
+
+# Prepare sector-level VAL+MOM strategy returns
+df_sectors = full_results_df.copy()
+df_sectors = df_sectors[df_sectors["industry"] != "Other"] # Exclude 'Other'
+df_sectors["crsp_date"] = pd.to_datetime(df_sectors["crsp_date"])
+
+# Merge Sector VAL+MOM data with FF factors
+df_merged_sectors = df_sectors.merge(
+    ff_factors, 
+    left_on="crsp_date", 
+    right_index=True, 
+    how="inner"
+)
+
+# Run regressions for each industry
+sector_results = {}
+
+for sector, group in df_merged_sectors.groupby("industry"):
+    
+    # Drop rows with NaNs in returns or factors for this specific group
+    group = group.dropna(subset=['r_val_mom', 'rf', 'mktrf', 'smb', 'hml', 'umd'])
+    
+    if group.empty:
+        print(f"Skipping {sector}: Not enough valid data after merging and dropping NaNs.")
+        continue # Skip sector if no valid data
+        
+    # No rf subtraction for long-short strategies
+    y = group["r_val_mom"]  # Long-short return (rf already cancels out)
+
+    # 1-factor model (Market only)
+    X_1f = group[["mktrf"]]
+    X_1f = sm.add_constant(X_1f)
+    model_1f = None # Initialize as None
+    try:
+        model_1f = sm.OLS(y, X_1f).fit()
+    except Exception as e:
+        print(f"Error fitting 1-factor model for {sector}: {e}")
+
+    # 3-factor model
+    X_3f = group[["mktrf", "smb", "hml"]]
+    X_3f = sm.add_constant(X_3f)
+    model_3f = None # Initialize as None
+    try:
+        model_3f = sm.OLS(y, X_3f).fit()
+    except Exception as e:
+        print(f"Error fitting 3-factor model for {sector}: {e}")
+        
+    # 4-factor model (adds umd = momentum)
+    X_4f = group[["mktrf", "smb", "hml", "umd"]]
+    X_4f = sm.add_constant(X_4f)
+    model_4f = None # Initialize as None
+    try:
+        model_4f = sm.OLS(y, X_4f).fit()
+    except Exception as e:
+        print(f"Error fitting 4-factor model for {sector}: {e}")
+
+    sector_results[sector] = {
+        "1-factor": model_1f,
+        "3-factor": model_3f,
+        "4-factor": model_4f
+    }
+
+# Extract and structure results
+summary_table = []
+
+for sector, models in sector_results.items():
+    row_data = {"Industry": sector}
+    
+    # Extract from 1-factor model if it exists
+    if models["1-factor"] is not None:
+        m1 = models["1-factor"]
+        row_data["Alpha (1F)"] = m1.params.get("const")
+        row_data["t(Alpha 1F)"] = m1.tvalues.get("const")
+        row_data["MktRf Coef (1F)"] = m1.params.get("mktrf")
+        row_data["t(MktRf 1F)"] = m1.tvalues.get("mktrf")
+        row_data["R-sq (1F)"] = m1.rsquared
+    else:
+        for col in ["Alpha (1F)", "t(Alpha 1F)", "MktRf Coef (1F)", "t(MktRf 1F)", "R-sq (1F)"]:
+            row_data[col] = None
+    
+    # Extract from 3-factor model if it exists
+    if models["3-factor"] is not None:
+        m3 = models["3-factor"]
+        row_data["Alpha (3F)"] = m3.params.get("const")
+        row_data["t(Alpha 3F)"] = m3.tvalues.get("const")
+        row_data["MktRf Coef (3F)"] = m3.params.get("mktrf")
+        row_data["t(MktRf 3F)"] = m3.tvalues.get("mktrf")
+        row_data["SMB Coef (3F)"] = m3.params.get("smb")
+        row_data["t(SMB 3F)"] = m3.tvalues.get("smb")
+        row_data["HML Coef (3F)"] = m3.params.get("hml")
+        row_data["t(HML 3F)"] = m3.tvalues.get("hml")
+        row_data["R-sq (3F)"] = m3.rsquared
+    else:
+        for col in ["Alpha (3F)", "t(Alpha 3F)", "MktRf Coef (3F)", "t(MktRf 3F)", 
+                    "SMB Coef (3F)", "t(SMB 3F)", "HML Coef (3F)", "t(HML 3F)", "R-sq (3F)"]:
+            row_data[col] = None
+
+    # Extract from 4-factor model if it exists
+    if models["4-factor"] is not None:
+        m4 = models["4-factor"]
+        row_data["Alpha (4F)"] = m4.params.get("const")
+        row_data["t(Alpha 4F)"] = m4.tvalues.get("const")
+        row_data["MktRf Coef (4F)"] = m4.params.get("mktrf")
+        row_data["t(MktRf 4F)"] = m4.tvalues.get("mktrf")
+        row_data["SMB Coef (4F)"] = m4.params.get("smb")
+        row_data["t(SMB 4F)"] = m4.tvalues.get("smb")
+        row_data["HML Coef (4F)"] = m4.params.get("hml")
+        row_data["t(HML 4F)"] = m4.tvalues.get("hml")
+        row_data["UMD Coef (4F)"] = m4.params.get("umd")
+        row_data["t(UMD 4F)"] = m4.tvalues.get("umd")
+        row_data["R-sq (4F)"] = m4.rsquared
+    else:
+        for col in ["Alpha (4F)", "t(Alpha 4F)", "MktRf Coef (4F)", "t(MktRf 4F)", 
+                    "SMB Coef (4F)", "t(SMB 4F)", "HML Coef (4F)", "t(HML 4F)",
+                    "UMD Coef (4F)", "t(UMD 4F)", "R-sq (4F)"]:
+            row_data[col] = None
+
+    summary_table.append(row_data)
+
+# Create and format DataFrame
+results_df = pd.DataFrame(summary_table)
+
+# Define desired column order
+column_order = [
+    "Industry",
+    "Alpha (1F)", "t(Alpha 1F)", "MktRf Coef (1F)", "t(MktRf 1F)", "R-sq (1F)",
+    "Alpha (3F)", "t(Alpha 3F)", 
+    "MktRf Coef (3F)", "t(MktRf 3F)", 
+    "SMB Coef (3F)", "t(SMB 3F)", 
+    "HML Coef (3F)", "t(HML 3F)", 
+    "R-sq (3F)",
+    "Alpha (4F)", "t(Alpha 4F)", 
+    "MktRf Coef (4F)", "t(MktRf 4F)",
+    "SMB Coef (4F)", "t(SMB 4F)", 
+    "HML Coef (4F)", "t(HML 4F)",
+    "UMD Coef (4F)", "t(UMD 4F)",
+    "R-sq (4F)"
+]
+
+results_df = results_df[[col for col in column_order if col in results_df.columns]]
+
+# Sort by 1-factor alpha if available
+if "Alpha (1F)" in results_df.columns:
+    results_df = results_df.sort_values(by="Alpha (1F)", ascending=False, na_position='last') 
+
+# Define formatting for display
+format_dict = {}
+for col in results_df.columns:
+    if col == "Industry":
+        continue
+    elif col.startswith("t("): # t-stats
+        format_dict[col] = '{:.2f}'
+    elif col.startswith("R-sq"): # R-squared values
+        format_dict[col] = '{:.4f}'
+    else: # Coefficients (including Alphas)
+        format_dict[col] = '{:.4f}'
+        
+# Final Output
+print("\n=== Sector-Level Regression Results: VAL+MOM Strategy (1F, 3F, 4F Models) ===")
+display(results_df.style.format(format_dict, na_rep="N/A"))
+
+# Also create a simplified comparison focusing on alphas across models
+print("\n=== Alpha Progression Across Models ===")
+alpha_comparison = results_df[['Industry', 'Alpha (1F)', 't(Alpha 1F)', 
+                              'Alpha (3F)', 't(Alpha 3F)', 
+                              'Alpha (4F)', 't(Alpha 4F)',
+                              'R-sq (1F)', 'R-sq (3F)', 'R-sq (4F)']].copy()
+
+display(alpha_comparison.style.format({
+    'Alpha (1F)': '{:.4f}', 't(Alpha 1F)': '{:.2f}',
+    'Alpha (3F)': '{:.4f}', 't(Alpha 3F)': '{:.2f}',
+    'Alpha (4F)': '{:.4f}', 't(Alpha 4F)': '{:.2f}',
+    'R-sq (1F)': '{:.4f}', 'R-sq (3F)': '{:.4f}', 'R-sq (4F)': '{:.4f}'
+}, na_rep="N/A"))
+
+###########################################################################
+########## Overall Portfolio Factor Analysis (Combo Strategy) ############
+###########################################################################
+
+print("\n" + "="*80)
+print("OVERALL PORTFOLIO FACTOR REGRESSION ANALYSIS")
+print("Combined Value+Momentum Strategy (Equal-Weighted Across All Sectors)")
+print("="*80)
+
+# Prepare overall portfolio data for factor regression
+overall_portfolio = strategy_returns[['r_combo_eq']].copy()
+overall_portfolio = overall_portfolio.reset_index()
+
+# Merge with Fama-French factors
+overall_merged = overall_portfolio.merge(
+    ff_factors, 
+    left_on="crsp_date", 
+    right_index=True, 
+    how="inner"
+)
+
+# Drop rows with NaNs in returns or factors
+overall_merged = overall_merged.dropna(subset=['r_combo_eq', 'rf', 'mktrf', 'smb', 'hml', 'umd'])
+
+# Function to add significance stars based on t-statistic
+def add_significance_stars_tstat(t_stat):
+    """Add significance stars based on t-statistic"""
+    abs_t = abs(t_stat)
+    if abs_t > 2.58:
+        return "***"
+    elif abs_t > 1.96:
+        return "**"
+    elif abs_t > 1.64:
+        return "*"
+    else:
+        return ""
+
+if overall_merged.empty:
+    print("Error: No valid data after merging overall portfolio with factors.")
+else:
+    print(f"Sample size: {len(overall_merged)} monthly observations")
+    print(f"Data period: {overall_merged['crsp_date'].min().strftime('%Y-%m')} to {overall_merged['crsp_date'].max().strftime('%Y-%m')}")
+    
+    # Dependent variable (long-short returns, rf cancels out)
+    y_overall = overall_merged["r_combo_eq"]
+
+    # 1-Factor Model (Market only)
+    print("\n--- 1-Factor (Market) Model Results ---")
+    X_1f_overall = overall_merged[["mktrf"]]
+    X_1f_overall = sm.add_constant(X_1f_overall)
+    
+    try:
+        model_1f_overall = sm.OLS(y_overall, X_1f_overall).fit()
+        print(model_1f_overall.summary())
+        
+        # Extract key results for display
+        alpha_1f = model_1f_overall.params['const']
+        t_alpha_1f = model_1f_overall.tvalues['const']
+        r_squared_1f = model_1f_overall.rsquared
+        
+        print(f"\nKey Results (1-Factor):")
+        print(f"Alpha: {alpha_1f:.4f} (t-stat: {t_alpha_1f:.2f})")
+        print(f"R-squared: {r_squared_1f:.4f}")
+        
+    except Exception as e:
+        print(f"Error fitting 1-factor model: {e}")
+        model_1f_overall = None
+
+    # 3-Factor Model
+    print("\n" + "-"*60)
+    print("--- 3-Factor Model Results ---")
+    X_3f_overall = overall_merged[["mktrf", "smb", "hml"]]
+    X_3f_overall = sm.add_constant(X_3f_overall)
+    
+    try:
+        model_3f_overall = sm.OLS(y_overall, X_3f_overall).fit()
+        print(model_3f_overall.summary())
+        
+        # Extract key results for display
+        alpha_3f = model_3f_overall.params['const']
+        t_alpha_3f = model_3f_overall.tvalues['const']
+        r_squared_3f = model_3f_overall.rsquared
+        
+        print(f"\nKey Results (3-Factor):")
+        print(f"Alpha: {alpha_3f:.4f} (t-stat: {t_alpha_3f:.2f})")
+        print(f"R-squared: {r_squared_3f:.4f}")
+        
+    except Exception as e:
+        print(f"Error fitting 3-factor model: {e}")
+        model_3f_overall = None
+
+    # 4-Factor Model  
+    print("\n" + "-"*60)
+    print("--- 4-Factor Model Results ---")
+    X_4f_overall = overall_merged[["mktrf", "smb", "hml", "umd"]]
+    X_4f_overall = sm.add_constant(X_4f_overall)
+    
+    try:
+        model_4f_overall = sm.OLS(y_overall, X_4f_overall).fit()
+        print(model_4f_overall.summary())
+        
+        # Extract key results for display
+        alpha_4f = model_4f_overall.params['const']
+        t_alpha_4f = model_4f_overall.tvalues['const']
+        r_squared_4f = model_4f_overall.rsquared
+        
+        print(f"\nKey Results (4-Factor):")
+        print(f"Alpha: {alpha_4f:.4f} (t-stat: {t_alpha_4f:.2f})")
+        print(f"R-squared: {r_squared_4f:.4f}")
+        
+    except Exception as e:
+        print(f"Error fitting 4-factor model: {e}")
+        model_4f_overall = None
+
+    # Summary Comparison Table WITH SIGNIFICANCE STARS
+    print("\n" + "="*80)
+    print("OVERALL PORTFOLIO REGRESSION SUMMARY (WITH SIGNIFICANCE STARS)")
+    print("="*80)
+    print("Significance levels: *** p<0.01, ** p<0.05, * p<0.10")
+    
+    comparison_data = []
+    
+    if model_1f_overall is not None:
+        alpha_sig = add_significance_stars_tstat(model_1f_overall.tvalues['const'])
+        mktrf_sig = add_significance_stars_tstat(model_1f_overall.tvalues['mktrf'])
+        
+        comparison_data.append({
+            'Model': '1-Factor',
+            'Alpha': f"{model_1f_overall.params['const']:.4f}{alpha_sig}",
+            't(Alpha)': f"{model_1f_overall.tvalues['const']:.2f}",
+            'MktRf Coef': f"{model_1f_overall.params['mktrf']:.4f}{mktrf_sig}",
+            't(MktRf)': f"{model_1f_overall.tvalues['mktrf']:.2f}",
+            'SMB Coef': 'N/A',
+            't(SMB)': 'N/A',
+            'HML Coef': 'N/A',
+            't(HML)': 'N/A',
+            'UMD Coef': 'N/A',
+            't(UMD)': 'N/A',
+            'R-squared': f"{model_1f_overall.rsquared:.4f}"
+        })
+    
+    if model_3f_overall is not None:
+        alpha_sig = add_significance_stars_tstat(model_3f_overall.tvalues['const'])
+        mktrf_sig = add_significance_stars_tstat(model_3f_overall.tvalues['mktrf'])
+        smb_sig = add_significance_stars_tstat(model_3f_overall.tvalues['smb'])
+        hml_sig = add_significance_stars_tstat(model_3f_overall.tvalues['hml'])
+        
+        comparison_data.append({
+            'Model': '3-Factor',
+            'Alpha': f"{model_3f_overall.params['const']:.4f}{alpha_sig}",
+            't(Alpha)': f"{model_3f_overall.tvalues['const']:.2f}",
+            'MktRf Coef': f"{model_3f_overall.params['mktrf']:.4f}{mktrf_sig}",
+            't(MktRf)': f"{model_3f_overall.tvalues['mktrf']:.2f}",
+            'SMB Coef': f"{model_3f_overall.params['smb']:.4f}{smb_sig}",
+            't(SMB)': f"{model_3f_overall.tvalues['smb']:.2f}",
+            'HML Coef': f"{model_3f_overall.params['hml']:.4f}{hml_sig}",
+            't(HML)': f"{model_3f_overall.tvalues['hml']:.2f}",
+            'UMD Coef': 'N/A',
+            't(UMD)': 'N/A',
+            'R-squared': f"{model_3f_overall.rsquared:.4f}"
+        })
+    
+    if model_4f_overall is not None:
+        alpha_sig = add_significance_stars_tstat(model_4f_overall.tvalues['const'])
+        mktrf_sig = add_significance_stars_tstat(model_4f_overall.tvalues['mktrf'])
+        smb_sig = add_significance_stars_tstat(model_4f_overall.tvalues['smb'])
+        hml_sig = add_significance_stars_tstat(model_4f_overall.tvalues['hml'])
+        umd_sig = add_significance_stars_tstat(model_4f_overall.tvalues['umd'])
+        
+        comparison_data.append({
+            'Model': '4-Factor',
+            'Alpha': f"{model_4f_overall.params['const']:.4f}{alpha_sig}",
+            't(Alpha)': f"{model_4f_overall.tvalues['const']:.2f}",
+            'MktRf Coef': f"{model_4f_overall.params['mktrf']:.4f}{mktrf_sig}",
+            't(MktRf)': f"{model_4f_overall.tvalues['mktrf']:.2f}",
+            'SMB Coef': f"{model_4f_overall.params['smb']:.4f}{smb_sig}",
+            't(SMB)': f"{model_4f_overall.tvalues['smb']:.2f}",
+            'HML Coef': f"{model_4f_overall.params['hml']:.4f}{hml_sig}",
+            't(HML)': f"{model_4f_overall.tvalues['hml']:.2f}",
+            'UMD Coef': f"{model_4f_overall.params['umd']:.4f}{umd_sig}",
+            't(UMD)': f"{model_4f_overall.tvalues['umd']:.2f}",
+            'R-squared': f"{model_4f_overall.rsquared:.4f}"
+        })
+    
+    if comparison_data:
+        comparison_df = pd.DataFrame(comparison_data)
+        display(comparison_df)
+    
+    # Alpha Progression Summary WITH ANNUALIZED VALUES
+    print("\n" + "="*60)
+    print("ALPHA PROGRESSION ACROSS MODELS (ANNUALIZED)")
+    print("="*60)
+    
+    alpha_progression = []
+    if model_1f_overall is not None:
+        alpha_monthly = model_1f_overall.params['const']
+        alpha_annual_pct = alpha_monthly * 12 * 100
+        significance = add_significance_stars_tstat(model_1f_overall.tvalues['const'])
+        
+        alpha_progression.append({
+            'Model': '1-Factor (Market)',
+            'Monthly Alpha': f"{alpha_monthly:.4f}",
+            'Annualized Alpha (%)': f"{alpha_annual_pct:.2f}%{significance}",
+            't-statistic': f"{model_1f_overall.tvalues['const']:.2f}",
+            'R-squared': f"{model_1f_overall.rsquared:.4f}"
+        })
+    
+    if model_3f_overall is not None:
+        alpha_monthly = model_3f_overall.params['const']
+        alpha_annual_pct = alpha_monthly * 12 * 100
+        significance = add_significance_stars_tstat(model_3f_overall.tvalues['const'])
+        
+        alpha_progression.append({
+            'Model': '3-Factor (FF)',
+            'Monthly Alpha': f"{alpha_monthly:.4f}",
+            'Annualized Alpha (%)': f"{alpha_annual_pct:.2f}%{significance}",
+            't-statistic': f"{model_3f_overall.tvalues['const']:.2f}",
+            'R-squared': f"{model_3f_overall.rsquared:.4f}"
+        })
+    
+    if model_4f_overall is not None:
+        alpha_monthly = model_4f_overall.params['const']
+        alpha_annual_pct = alpha_monthly * 12 * 100
+        significance = add_significance_stars_tstat(model_4f_overall.tvalues['const'])
+        
+        alpha_progression.append({
+            'Model': '4-Factor (Carhart)',
+            'Monthly Alpha': f"{alpha_monthly:.4f}",
+            'Annualized Alpha (%)': f"{alpha_annual_pct:.2f}%{significance}",
+            't-statistic': f"{model_4f_overall.tvalues['const']:.2f}",
+            'R-squared': f"{model_4f_overall.rsquared:.4f}"
+        })
+    
+    if alpha_progression:
+        progression_df = pd.DataFrame(alpha_progression)
+        display(progression_df)
+        print("\nSignificance levels: *** p<0.01, ** p<0.05, * p<0.10")
+        print("Note: Annualized alphas computed as monthly_alpha × 12")
+    
+    print("="*80)
+
+    ###########################################################################
+########## Annualized Alpha Analysis with Significance Testing ###########
+###########################################################################
+
+print("\n" + "="*80)
+print("ANNUALIZED ALPHA ANALYSIS WITH SIGNIFICANCE TESTING")
+print("="*80)
+
+# Function to add significance stars based on t-statistic
+def add_significance_stars_tstat(t_stat):
+    """Add significance stars based on t-statistic"""
+    abs_t = abs(t_stat)
+    if abs_t > 2.58:
+        return "***"
+    elif abs_t > 1.96:
+        return "**"
+    elif abs_t > 1.64:
+        return "*"
+    else:
+        return ""
+
+# Create annualized alpha summary
+annualized_results = []
+
+if model_1f_overall is not None:
+    alpha_monthly = model_1f_overall.params['const']
+    alpha_annual_pct = alpha_monthly * 12 * 100  # Convert to annual percentage
+    t_stat = model_1f_overall.tvalues['const']
+    p_value = model_1f_overall.pvalues['const']
+    significance = add_significance_stars_tstat(t_stat)
+    
+    annualized_results.append({
+        'Model': '1-Factor (Market)',
+        'Monthly Alpha': f"{alpha_monthly:.4f}",
+        'Annualized Alpha (%)': f"{alpha_annual_pct:.2f}%{significance}",
+        't-statistic': f"{t_stat:.2f}",
+        'p-value': f"{p_value:.4f}",
+        'R-squared': f"{model_1f_overall.rsquared:.4f}"
+    })
+
+if model_3f_overall is not None:
+    alpha_monthly = model_3f_overall.params['const']
+    alpha_annual_pct = alpha_monthly * 12 * 100  # Convert to annual percentage
+    t_stat = model_3f_overall.tvalues['const']
+    p_value = model_3f_overall.pvalues['const']
+    significance = add_significance_stars_tstat(t_stat)
+    
+    annualized_results.append({
+        'Model': '3-Factor (Fama-French)',
+        'Monthly Alpha': f"{alpha_monthly:.4f}",
+        'Annualized Alpha (%)': f"{alpha_annual_pct:.2f}%{significance}",
+        't-statistic': f"{t_stat:.2f}",
+        'p-value': f"{p_value:.4f}",
+        'R-squared': f"{model_3f_overall.rsquared:.4f}"
+    })
+
+if model_4f_overall is not None:
+    alpha_monthly = model_4f_overall.params['const']
+    alpha_annual_pct = alpha_monthly * 12 * 100  # Convert to annual percentage
+    t_stat = model_4f_overall.tvalues['const']
+    p_value = model_4f_overall.pvalues['const']
+    significance = add_significance_stars_tstat(t_stat)
+    
+    annualized_results.append({
+        'Model': '4-Factor (Carhart)',
+        'Monthly Alpha': f"{alpha_monthly:.4f}",
+        'Annualized Alpha (%)': f"{alpha_annual_pct:.2f}%{significance}",
+        't-statistic': f"{t_stat:.2f}",
+        'p-value': f"{p_value:.4f}",
+        'R-squared': f"{model_4f_overall.rsquared:.4f}"
+    })
+
+# Display the annualized results table
+if annualized_results:
+    annualized_df = pd.DataFrame(annualized_results)
+    
+    print("COMBINED VALUE-MOMENTUM STRATEGY: ANNUALIZED ALPHA SUMMARY")
+    print("-" * 70)
+    display(annualized_df)
+    
+    print("\nSignificance levels: *** p<0.01, ** p<0.05, * p<0.10")
+    print("Note: Annualized alphas computed as monthly_alpha × 12")
+
+# Summary of alpha progression
+print("\n" + "="*60)
+print("ALPHA EVOLUTION ACROSS FACTOR MODELS")
+print("="*60)
+
+for i, result in enumerate(annualized_results):
+    model_name = result['Model']
+    ann_alpha = result['Annualized Alpha (%)']
+    t_stat = result['t-statistic']
+    r_sq = result['R-squared']
+    
+    print(f"{model_name}:")
+    print(f"  Annualized Alpha: {ann_alpha}")
+    print(f"  t-statistic: {t_stat}")
+    print(f"  R-squared: {r_sq}")
+    print()
+
+# Key insights
+print("KEY INSIGHTS:")
+print("-" * 30)
+
+if len(annualized_results) >= 2:
+    # Compare 1-factor vs multi-factor
+    alpha_1f = float(annualized_results[0]['Monthly Alpha']) * 12 * 100
+    if len(annualized_results) >= 3:
+        alpha_4f = float(annualized_results[2]['Monthly Alpha']) * 12 * 100
+        alpha_change = alpha_4f - alpha_1f
+        print(f"• Alpha change from 1-Factor to 4-Factor: {alpha_change:+.2f}% annually")
+    
+    # R-squared improvement
+    if len(annualized_results) >= 3:
+        r2_1f = float(annualized_results[0]['R-squared'])
+        r2_4f = float(annualized_results[2]['R-squared'])
+        r2_improvement = (r2_4f - r2_1f) * 100
+        print(f"• Explanatory power improvement: {r2_improvement:+.1f} percentage points")
+
+print("="*80)
+
+##################################################################
+########## MARKET SHARPE RATIO FROM KENNETH FRENCH DATA ########
+##################################################################
+
+print("\n" + "="*80)
+print("MARKET SHARPE RATIO ANALYSIS (1981-01 to 2022-05)")
+print("="*80)
+print("Using Kenneth French Mkt-RF data")
+print("="*80)
+
+# Filter FF data for the analysis period (1981-01-01 to 2022-05)
+start_date = "1981-01-01"
+end_date = "2022-05-31"
+
+# Filter the Fama-French data that's already loaded
+ff_market_data = ff_factors.copy()
+ff_market_data = ff_market_data[(ff_market_data.index >= start_date) & 
+                                (ff_market_data.index <= end_date)]
+
+# Get market excess returns (Mkt-RF is already excess return over risk-free rate)
+market_excess_returns = ff_market_data["mktrf"] / 100  # Convert from percentage to decimal
+
+# Remove any NaN values
+market_excess_returns = market_excess_returns.dropna()
+
+if len(market_excess_returns) > 12:
+    # Calculate monthly statistics
+    mean_excess_return = market_excess_returns.mean()
+    std_excess_return = market_excess_returns.std()
+    
+    # Monthly Sharpe ratio (since Mkt-RF is already excess return)
+    monthly_sharpe = mean_excess_return / std_excess_return if std_excess_return > 0 else np.nan
+    
+    # Annualized figures
+    ann_mean_excess = mean_excess_return * 12 * 100  # Annualized excess return in %
+    ann_std = std_excess_return * np.sqrt(12) * 100  # Annualized standard deviation in %
+    ann_sharpe = monthly_sharpe * np.sqrt(12)  # Annualized Sharpe ratio
+    
+    print(f"\nMARKET PERFORMANCE STATISTICS:")
+    print("-" * 50)
+    print(f"Sample Period:           {start_date} to {end_date}")
+    print(f"Number of Observations:  {len(market_excess_returns)}")
+    print(f"")
+    print(f"Monthly Statistics:")
+    print(f"  Mean Excess Return:    {mean_excess_return*100:.4f}%")
+    print(f"  Standard Deviation:    {std_excess_return*100:.4f}%")
+    print(f"  Sharpe Ratio:          {monthly_sharpe:.4f}")
+    print(f"")
+    print(f"Annualized Statistics:")
+    print(f"  Mean Excess Return:    {ann_mean_excess:.2f}%")
+    print(f"  Standard Deviation:    {ann_std:.2f}%")
+    print(f"  Sharpe Ratio:          {ann_sharpe:.4f}")
+    
+    print("\n" + "="*80)
+    print("MARKET SHARPE RATIO SUMMARY:")
+    print(f"The market Sharpe ratio for the period {start_date} to {end_date} is {ann_sharpe:.4f}")
+    print("="*80)
+    
+else:
+    print("Insufficient data to calculate market Sharpe ratio")
+
+print("\n" + "="*80)
+print("METHODOLOGY NOTES:")
+print("- Uses Kenneth French Mkt-RF (market excess return) data")
+print("- Sharpe Ratio = Mean(Mkt-RF) / Std(Mkt-RF)")
+print("- Mkt-RF is already excess return over risk-free rate")
+print("- Annualized Sharpe = Monthly Sharpe × √12")
+print("- Data source: Kenneth French Data Library")
+print("="*80)
